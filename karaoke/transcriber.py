@@ -6,7 +6,7 @@ import logging
 
 from .config import WHISPER_BEAM_SIZE, WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_HEBREW_MODEL, WHISPER_LANGUAGE
 from .exceptions import TranscriptionError
-from .models import TranscriptDraft, TranscriptSegment, WordTiming
+from .models import CharacterTiming, TranscriptDraft, TranscriptSegment, WordTiming
 
 logger = logging.getLogger(__name__)
 _model = None
@@ -86,6 +86,48 @@ class FasterWhisperHebrewProvider:
         if not segments:
             raise TranscriptionError("No words were detected in the vocal track.", "לא זוהו מילים באודיו.")
         return TranscriptDraft(segments=segments, provider=self.name)
+
+
+def interpolate_character_timings(word: WordTiming) -> list[CharacterTiming]:
+    """Interpolate character-level timing from word timing using grapheme weights.
+
+    Uses the same grapheme weight logic as aligner.py: Hebrew niqqud marks
+    receive lower weight than consonants for proportional time distribution.
+    """
+    from .aligner import _split_graphemes, _grapheme_weight
+
+    graphemes = _split_graphemes(word.word)
+    if not graphemes:
+        return []
+
+    weights = [_grapheme_weight(g) for g in graphemes]
+    total_weight = sum(weights)
+    if total_weight == 0:
+        total_weight = len(graphemes)
+        weights = [1.0] * len(graphemes)
+
+    duration = word.end - word.start
+    timings = []
+    cursor = word.start
+
+    for grapheme, weight in zip(graphemes, weights):
+        char_duration = duration * (weight / total_weight)
+        timings.append(CharacterTiming(
+            char=grapheme,
+            start=round(cursor, 4),
+            end=round(cursor + char_duration, 4),
+        ))
+        cursor += char_duration
+
+    # Snap last character end to word boundary
+    if timings:
+        timings[-1] = CharacterTiming(
+            char=timings[-1].char,
+            start=timings[-1].start,
+            end=word.end,
+        )
+
+    return timings
 
 
 def transcribe_hebrew(audio_path: str) -> list[TranscriptSegment]:

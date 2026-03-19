@@ -156,6 +156,7 @@ class WordTiming:
     source: str = "draft_whisper"
     aligned: bool = False
     subwords: list[SubWordTiming] = field(default_factory=list)
+    char_timings: list["CharacterTiming"] = field(default_factory=list)
 
 
 @dataclass
