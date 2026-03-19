@@ -83,6 +83,8 @@ class LyricsVerificationResult:
     applied: bool = False
     selected_option_id: str = "draft"
     options: list[dict[str, object]] = field(default_factory=list)
+    consensus_result: "ConsensusResult | None" = None
+    source_versions: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass

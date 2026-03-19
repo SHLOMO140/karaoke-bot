@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-from .models import LyricsVerificationResult, TranscriptDraft
+from .models import LyricsVerificationResult, TranscriptDraft, VerificationVerdict, ConsensusResult
 
 logger = logging.getLogger(__name__)
 
@@ -1279,3 +1279,308 @@ class HybridLyricsVerifier:
         if not gemini_result.search_query:
             gemini_result.search_query = preferred_result.search_query
         return gemini_result
+
+
+class MultiStepLyricsVerifier:
+    """Multi-step lyrics verifier with parallel source search, consensus, and Gemini fallback."""
+
+    name = "multi_step_lyrics_verifier"
+
+    def __init__(self):
+        from .config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID, GEMINI_API_KEY, GEMINI_MODEL
+        from .google_search import GoogleSearchProvider, YouTubeDescriptionProvider
+        from .consensus import ConsensusEngine
+
+        self._google = GoogleSearchProvider(api_key=GOOGLE_API_KEY, engine_id=GOOGLE_SEARCH_ENGINE_ID)
+        self._youtube = YouTubeDescriptionProvider(api_key=GOOGLE_API_KEY)
+        self._consensus = ConsensusEngine()
+        self._gemini_api_key = GEMINI_API_KEY
+        self._gemini_model = GEMINI_MODEL
+
+    def verify(self, title: str, draft: TranscriptDraft) -> LyricsVerificationResult:
+        """Main entry point: search sources, build consensus, fall back to Gemini if needed."""
+        # Step 1: Extract draft text
+        draft_text = draft.text
+
+        # Step 2: Search all sources
+        try:
+            sources = self._search_all_sources(title, draft_text)
+        except Exception as exc:
+            logger.warning("Source search failed: %s", exc)
+            sources = {}
+
+        # Step 3: Run consensus
+        consensus = self._consensus.evaluate(sources)
+
+        # Case A: Consensus reached (3+ sources agree on ALL lines)
+        if consensus.consensus_reached and consensus.agreed_sources >= 3:
+            return LyricsVerificationResult(
+                provider=self.name,
+                verdict=VerificationVerdict.CONSENSUS.value,
+                confidence=0.95,
+                corrected_lines=consensus.lyrics,
+                correction_count=0,
+                matched_sources=list(sources.keys()),
+                summary=f"קונצנזוס בין {consensus.agreed_sources} מקורות",
+                consensus_result=consensus,
+                source_versions=sources,
+            )
+
+        # Case B: No sources found — use Gemini knowledge-based check
+        if not sources:
+            try:
+                lyrics, confidence = self._gemini_knowledge_verify(draft_text, title)
+                return LyricsVerificationResult(
+                    provider=self.name,
+                    verdict=VerificationVerdict.NO_SOURCES.value,
+                    confidence=confidence,
+                    corrected_lines=lyrics,
+                    correction_count=0,
+                    matched_sources=[],
+                    summary="לא נמצאו מקורות אונליין, בוצע אימות על בסיס ידע Gemini",
+                    local_warnings=["לא נמצאו מקורות מילים באינטרנט"],
+                    consensus_result=consensus,
+                    source_versions=sources,
+                )
+            except Exception as exc:
+                logger.warning("Gemini knowledge verify failed: %s", exc)
+                return LyricsVerificationResult(
+                    provider=self.name,
+                    verdict=VerificationVerdict.NO_SOURCES.value,
+                    confidence=0.3,
+                    corrected_lines=draft_text.splitlines(),
+                    correction_count=0,
+                    matched_sources=[],
+                    summary="לא נמצאו מקורות ו-Gemini לא זמין",
+                    local_warnings=[
+                        "לא נמצאו מקורות מילים באינטרנט",
+                        f"שגיאה בגישה ל-Gemini: {exc}",
+                    ],
+                    consensus_result=consensus,
+                    source_versions=sources,
+                )
+
+        # Case C: Sources found but no consensus — Gemini decides
+        try:
+            lyrics, confidence, uncertain = self._gemini_deep_verify(
+                sources, consensus.disputes, title
+            )
+            return LyricsVerificationResult(
+                provider=self.name,
+                verdict=VerificationVerdict.GEMINI_VERIFIED.value,
+                confidence=confidence,
+                corrected_lines=lyrics,
+                correction_count=0,
+                matched_sources=list(sources.keys()),
+                summary=f"Gemini הכריע בין {len(sources)} מקורות",
+                consensus_result=consensus,
+                source_versions=sources,
+            )
+        except Exception as exc:
+            logger.warning("Gemini deep verify failed: %s", exc)
+            # Fallback: return best available (consensus lyrics even without full agreement)
+            return LyricsVerificationResult(
+                provider=self.name,
+                verdict=VerificationVerdict.GEMINI_VERIFIED.value,
+                confidence=0.5,
+                corrected_lines=consensus.lyrics,
+                correction_count=0,
+                matched_sources=list(sources.keys()),
+                summary="Gemini לא זמין, מוחזר תוצאה הטובה ביותר מהמקורות",
+                local_warnings=[f"שגיאה ב-Gemini: {exc}"],
+                consensus_result=consensus,
+                source_versions=sources,
+            )
+
+    def _search_all_sources(self, title: str, draft_text: str) -> dict[str, list[str]]:
+        """Search multiple sources in parallel and return source_name -> lyrics lines."""
+        import concurrent.futures
+
+        queries = _build_query_variants(title, draft_text)
+        sources: dict[str, list[str]] = {}
+
+        # Collect URLs from Google search
+        urls_by_domain: dict[str, str] = {}  # domain -> first URL
+        google_failed = False
+
+        for query in queries[:3]:
+            try:
+                results = self._google.search(query, num=10)
+                for result in results:
+                    domain = _domain_from_url(result.url)
+                    if domain in KNOWN_LYRICS_DOMAINS and domain not in urls_by_domain:
+                        urls_by_domain[domain] = result.url
+            except Exception as exc:
+                logger.warning("Google search failed for query '%s': %s", query, exc)
+                if "429" in str(exc):
+                    google_failed = True
+                    break
+
+        # Fallback to DuckDuckGo if Google returned 429
+        if google_failed or not urls_by_domain:
+            for query in queries[:3]:
+                try:
+                    results = _search_duckduckgo_results(query)
+                    for result in results:
+                        domain = _domain_from_url(result.url)
+                        if domain in KNOWN_LYRICS_DOMAINS and domain not in urls_by_domain:
+                            urls_by_domain[domain] = result.url
+                except Exception as exc:
+                    logger.warning("DuckDuckGo fallback failed: %s", exc)
+
+        # Fetch and parse lyrics from each URL in parallel
+        def _fetch_and_parse(domain: str, url: str) -> tuple[str, list[str]]:
+            try:
+                req = urllib.request.Request(url, headers=SEARCH_HEADERS)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    html_body = resp.read().decode("utf-8", errors="replace")
+                # Try site-specific extraction first
+                specific = _extract_site_specific_lyrics(url, html_body)
+                if specific:
+                    text = _strip_html_preserving_lines(specific)
+                else:
+                    text = _strip_html_preserving_lines(html_body)
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                # Filter to lines with Hebrew content
+                hebrew_lines = [
+                    line for line in lines
+                    if re.search(r"[\u0590-\u05FF]", line) and len(line) >= 2
+                ]
+                if hebrew_lines:
+                    return _domain_option_key(url), hebrew_lines
+            except Exception as exc:
+                logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
+            return _domain_option_key(url), []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_fetch_and_parse, domain, url): domain
+                for domain, url in urls_by_domain.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    key, lines = future.result()
+                    if lines:
+                        sources[key] = lines
+                except Exception as exc:
+                    logger.warning("Source fetch error: %s", exc)
+
+        # Also try YouTube descriptions
+        try:
+            yt_results = self._youtube.search(f"{title} מילים", max_results=3)
+            for yt_result in yt_results:
+                desc = yt_result.snippet
+                if desc and re.search(r"[\u0590-\u05FF]", desc):
+                    lines = [
+                        line.strip() for line in desc.splitlines()
+                        if line.strip() and re.search(r"[\u0590-\u05FF]", line) and len(line.strip()) >= 2
+                    ]
+                    if len(lines) >= 3:
+                        sources[f"youtube_{yt_result.title[:20]}"] = lines
+                        break  # Use first good YouTube result
+        except Exception as exc:
+            logger.warning("YouTube search failed: %s", exc)
+
+        return sources
+
+    def _gemini_deep_verify(
+        self,
+        sources: dict[str, list[str]],
+        disputes: list,
+        title: str,
+    ) -> tuple[list[str], float, list[str]]:
+        """Call Gemini to decide which version is correct among disagreeing sources."""
+        source_text = ""
+        for source_name, lines in sources.items():
+            source_text += f"\n--- מקור: {source_name} ---\n"
+            source_text += "\n".join(lines)
+            source_text += "\n"
+
+        dispute_text = ""
+        if disputes:
+            dispute_text = "\n\nשורות שנויות במחלוקת:\n"
+            for d in disputes:
+                dispute_text += f"שורה {d.line_number + 1}:\n"
+                for src, ver in d.versions.items():
+                    dispute_text += f"  {src}: {ver}\n"
+
+        prompt = (
+            f"אתה מומחה למילות שירים בעברית.\n"
+            f"שם השיר: {title}\n\n"
+            f"להלן גרסאות מילים ממקורות שונים:{source_text}"
+            f"{dispute_text}\n"
+            f"המשימה שלך:\n"
+            f"1. השווה את כל הגרסאות\n"
+            f"2. החלט איזו גרסה נכונה לכל שורה\n"
+            f"3. אם אתה לא בטוח בשורה מסוימת, סמן אותה עם [?]\n\n"
+            f"ודא שאתה מחזיר את המילים הנכונות בלבד, שורה אחת לכל שורת שיר.\n"
+            f"בדוק את עצמך: האם המילים הגיוניות בהקשר של השיר?\n\n"
+            f"החזר את התוצאה בפורמט הבא:\n"
+            f"CONFIDENCE: <מספר בין 0 ל-1>\n"
+            f"UNCERTAIN: <מילים לא ודאיות מופרדות בפסיקים, או NONE>\n"
+            f"LYRICS:\n<המילים הנכונות, שורה לשורה>"
+        )
+
+        response_text = _call_gemini(prompt, self._gemini_api_key, self._gemini_model, timeout=30)
+        return self._parse_gemini_response(response_text)
+
+    def _gemini_knowledge_verify(
+        self,
+        whisper_text: str,
+        title: str,
+    ) -> tuple[list[str], float]:
+        """Call Gemini with Whisper transcript for knowledge-based verification."""
+        prompt = (
+            f"אתה מומחה למילות שירים בעברית.\n"
+            f"שם השיר: {title}\n\n"
+            f"להלן תמלול אוטומטי (Whisper) של השיר:\n{whisper_text}\n\n"
+            f"המשימה שלך:\n"
+            f"1. בדוק אם אתה מכיר את השיר הזה\n"
+            f"2. תקן שגיאות בתמלול על בסיס הידע שלך\n"
+            f"3. אם אתה לא מכיר את השיר, החזר את התמלול כמו שהוא\n\n"
+            f"החזר את התוצאה בפורמט הבא:\n"
+            f"CONFIDENCE: <מספר בין 0 ל-1>\n"
+            f"LYRICS:\n<המילים, שורה לשורה>"
+        )
+
+        response_text = _call_gemini(prompt, self._gemini_api_key, self._gemini_model, timeout=30)
+        lyrics, confidence, _ = self._parse_gemini_response(response_text)
+        return lyrics, confidence
+
+    @staticmethod
+    def _parse_gemini_response(response_text: str) -> tuple[list[str], float, list[str]]:
+        """Parse structured Gemini response into lyrics, confidence, uncertain words."""
+        confidence = 0.7
+        uncertain: list[str] = []
+        lyrics_lines: list[str] = []
+
+        lines = response_text.strip().splitlines()
+        in_lyrics = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.upper().startswith("CONFIDENCE:"):
+                try:
+                    confidence = float(stripped.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif stripped.upper().startswith("UNCERTAIN:"):
+                val = stripped.split(":", 1)[1].strip()
+                if val.upper() != "NONE" and val:
+                    uncertain = [w.strip() for w in val.split(",") if w.strip()]
+            elif stripped.upper().startswith("LYRICS:"):
+                in_lyrics = True
+                remainder = stripped.split(":", 1)[1].strip()
+                if remainder:
+                    lyrics_lines.append(remainder)
+            elif in_lyrics and stripped:
+                lyrics_lines.append(stripped)
+
+        if not lyrics_lines:
+            # Fallback: treat entire response as lyrics
+            lyrics_lines = [l.strip() for l in lines if l.strip()]
+
+        return lyrics_lines, confidence, uncertain
+
+    def post_review_steps(self, job, original_draft):
+        """Placeholder for Steps 5-7, called from bot.py after user approval."""
+        pass
