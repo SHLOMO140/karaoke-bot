@@ -1,0 +1,147 @@
+"""Named karaoke style presets."""
+
+from __future__ import annotations
+
+from .config import DEFAULT_STYLE_PRESET
+from .models import KaraokeStyle
+
+LEGACY_STYLE_ALIASES = {
+    "classic_hebrew": "reference_blue",
+}
+
+
+STYLE_PRESETS: dict[str, KaraokeStyle] = {
+    "classic_hebrew": KaraokeStyle(
+        font_name="Arial",
+        font_size=64,
+        primary_color="&H00FFFFFF",
+        secondary_color="&H0000FFFF",
+        outline_color="&H00000000",
+        shadow_color="&H80000000",
+        outline_width=3,
+        shadow_depth=1,
+        alignment=2,
+        margin_v=56,
+        margin_l=32,
+        margin_r=32,
+        bold=-1,
+        encoding=-1,
+        effect_mode="sweep",
+        max_words_per_line=4,
+        max_chars_per_line=26,
+        line_height_scale=1.28,
+        word_spacing_scale=1.20,
+        blur=0.2,
+        base_fill_alpha="60",
+        active_fill_alpha="00",
+    ),
+    "blue_outline": KaraokeStyle(
+        font_name="Arial",
+        font_size=98,
+        primary_color="&H00FFFFFF",
+        secondary_color="&H00FF7A00",
+        outline_color="&H00D41414",
+        shadow_color="&H70000000",
+        outline_width=7,
+        shadow_depth=4,
+        alignment=2,
+        margin_v=36,
+        margin_l=28,
+        margin_r=28,
+        bold=-1,
+        encoding=-1,
+        effect_mode="grapheme_highlight",
+        max_words_per_line=4,
+        max_chars_per_line=18,
+        line_height_scale=1.10,
+        word_spacing_scale=1.55,
+        grapheme_fade_ms=55,
+        blur=1.0,
+        base_fill_alpha="00",
+        active_fill_alpha="00",
+    ),
+    "soft_gold": KaraokeStyle(
+        font_name="Arial",
+        font_size=62,
+        primary_color="&H00F8F3E8",
+        secondary_color="&H0000D7FF",
+        outline_color="&H00202020",
+        shadow_color="&H80000000",
+        outline_width=3,
+        shadow_depth=1,
+        alignment=2,
+        margin_v=58,
+        margin_l=34,
+        margin_r=34,
+        bold=-1,
+        encoding=-1,
+        effect_mode="sweep",
+        max_words_per_line=4,
+        max_chars_per_line=24,
+        line_height_scale=1.24,
+        word_spacing_scale=1.30,
+        blur=0.25,
+        base_fill_alpha="58",
+        active_fill_alpha="00",
+    ),
+    "reference_blue": KaraokeStyle(
+        font_name="Arial",
+        font_size=98,
+        primary_color="&H00FFFFFF",
+        secondary_color="&H00FF7A00",
+        outline_color="&H00D41414",
+        shadow_color="&H70000000",
+        outline_width=7,
+        shadow_depth=4,
+        alignment=2,
+        margin_v=36,
+        margin_l=28,
+        margin_r=28,
+        bold=-1,
+        encoding=-1,
+        effect_mode="grapheme_highlight",
+        max_words_per_line=4,
+        max_chars_per_line=18,
+        line_height_scale=1.10,
+        word_spacing_scale=1.55,
+        grapheme_fade_ms=55,
+        blur=1.0,
+        base_fill_alpha="00",
+        active_fill_alpha="00",
+    ),
+    "kdam_box": KaraokeStyle(
+        font_name="Arial",
+        font_size=100,
+        primary_color="&H00FFFFFF",
+        secondary_color="&H00E86420",
+        outline_color="&H00000000",
+        shadow_color="&H96000000",
+        outline_width=5,
+        shadow_depth=2,
+        border_style=1,
+        alignment=2,
+        margin_v=30,
+        margin_l=30,
+        margin_r=30,
+        bold=-1,
+        encoding=-1,
+        effect_mode="sweep",
+        max_words_per_line=4,
+        max_chars_per_line=18,
+        line_height_scale=1.22,
+        word_spacing_scale=1.0,
+        blur=0,
+        base_fill_alpha="44",
+        active_fill_alpha="00",
+    ),
+}
+
+
+def normalize_style_preset(style_name: str | None = None) -> str:
+    preset = style_name or DEFAULT_STYLE_PRESET
+    return LEGACY_STYLE_ALIASES.get(preset, preset)
+
+
+def get_style(style_name: str | None = None) -> KaraokeStyle:
+    preset = normalize_style_preset(style_name)
+    return STYLE_PRESETS.get(preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])

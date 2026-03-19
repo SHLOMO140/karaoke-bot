@@ -1,0 +1,10 @@
+python-telegram-bot==21.6
+yt-dlp
+faster-whisper
+demucs
+whisperx
+numpy
+librosa
+Pillow
+regex
+pytest

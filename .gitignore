@@ -1,0 +1,12 @@
+.env
+.env.local
+.venv/
+__pycache__/
+*.pyc
+.cache/
+downloads/
+*.log
+.debug_bot_*.txt
+bot_token.txt
+firebase-debug*.log
+.claude/
