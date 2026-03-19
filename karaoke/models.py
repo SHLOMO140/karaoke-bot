@@ -94,6 +94,60 @@ class SubWordTiming:
 
 
 @dataclass
+class CharacterTiming:
+    """Timing for a single character/grapheme cluster."""
+    char: str
+    start: float
+    end: float
+
+
+class VerificationVerdict(str, Enum):
+    """Verdict for the new multi-step lyrics verification."""
+    CONSENSUS = "consensus"          # 3+ sources agreed
+    GEMINI_VERIFIED = "gemini_verified"  # Gemini decided
+    HUMAN_APPROVED = "human_approved"    # User approved/corrected
+    NO_SOURCES = "no_sources"        # No web sources found
+    NOT_RUN = "not_run"
+
+
+@dataclass
+class DisputedLine:
+    """A lyrics line where sources disagree."""
+    line_number: int
+    versions: dict[str, str]  # source_name → text
+    gemini_recommendation: str | None = None
+    gemini_confidence: float = 0.0
+
+
+@dataclass
+class ConsensusResult:
+    """Result of consensus engine comparing multiple sources."""
+    consensus_reached: bool
+    agreed_sources: int
+    lyrics: list[str]
+    disputes: list[DisputedLine] = field(default_factory=list)
+
+
+@dataclass
+class CharChange:
+    """A single character-level change."""
+    position: int
+    old_char: str
+    new_char: str
+    change_type: str  # "replaced", "added", "removed"
+
+
+@dataclass
+class CharDiff:
+    """Character-level diff for one word."""
+    word_index: int
+    original_word: str
+    corrected_word: str
+    char_changes: list[CharChange] = field(default_factory=list)
+    gemini_explanation: str | None = None
+
+
+@dataclass
 class WordTiming:
     word: str
     start: float
