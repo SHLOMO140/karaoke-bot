@@ -127,8 +127,43 @@ def _load_gemini_api_key() -> str:
     return ""
 
 
+def _load_google_api_key() -> str:
+    value = os.getenv("GOOGLE_API_KEY", "").strip()
+    if value:
+        return value
+    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.local"):
+        value = _load_env_value(candidate, {"GOOGLE_API_KEY"})
+        if value:
+            return value
+    return ""
+
+
+def _load_google_search_engine_id() -> str:
+    value = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "").strip()
+    if value:
+        return value
+    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.local"):
+        value = _load_env_value(candidate, {"GOOGLE_SEARCH_ENGINE_ID"})
+        if value:
+            return value
+    return ""
+
+
 GEMINI_API_KEY = _load_gemini_api_key()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Google Custom Search API
+GOOGLE_API_KEY: str = _load_google_api_key()
+GOOGLE_SEARCH_ENGINE_ID: str = _load_google_search_engine_id()
+
+# YouTube Data API (uses same GOOGLE_API_KEY)
+YOUTUBE_API_ENABLED: bool = bool(GOOGLE_API_KEY)
+
+# Consensus engine
+CONSENSUS_MIN_SOURCES: int = 3  # minimum sources for auto-verification
+
+# Verification loop
+MAX_REVIEW_ITERATIONS: int = 2  # max round-trips through steps 4-6
 
 WHISPER_HEBREW_MODEL = os.getenv(
     "KARAOKE_HEBREW_WHISPER_MODEL",
