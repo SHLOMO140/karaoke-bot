@@ -1028,8 +1028,10 @@ def _build_subword_timings(word: WordTiming, energy: np.ndarray, hop_seconds: fl
             if total_span > 0:
                 # Compute target durations based on energy proportions
                 energy_durations = [(e / total_energy_share) * total_span for e in energy_shares]
-                # Blend: 40% energy-based, 60% current placement (avoid over-correction)
-                ENERGY_BLEND = 0.40
+                # Blend: 55% energy-based, 45% current placement — let actual
+                # vocal energy distribution dominate grapheme duration so
+                # sustained vowels hold longer and quick consonants are shorter.
+                ENERGY_BLEND = 0.55
                 current_durations = [chosen_boundaries[gi + 1] - chosen_boundaries[gi] for gi in range(len(graphemes))]
                 blended_durations = [
                     current_durations[gi] * (1.0 - ENERGY_BLEND) + energy_durations[gi] * ENERGY_BLEND
@@ -1752,3 +1754,57 @@ def validate_timing_quality(segments: list[TranscriptSegment]) -> list[str]:
         warnings.append(f"נמצאו {subword_violations} בעיות בטיימינג תת-מילתי — עלול להשפיע על אנימציית הגרפמות.")
 
     return warnings
+
+
+def realign_changed_words(
+    original_word: "WordTiming",
+    corrected_text: str,
+    audio_path: str | None = None,
+) -> "list[CharacterTiming]":
+    """Recalculate character-level timing for a corrected word.
+
+    Part A: Redistribute timing proportionally based on new graphemes.
+    Part B: If audio_path provided, verify against wav2vec2 and prefer
+            audio timing when gap > 50ms.
+    """
+    from .models import CharacterTiming, WordTiming
+    from .transcriber import interpolate_character_timings
+
+    # Create a temporary WordTiming for the corrected text with same boundaries
+    temp_word = WordTiming(
+        word=corrected_text,
+        start=original_word.start,
+        end=original_word.end,
+        confidence=original_word.confidence,
+        source="corrected",
+        aligned=False,
+    )
+
+    # Part A: Interpolate using grapheme weights
+    new_timings = interpolate_character_timings(temp_word)
+
+    # Part B: Audio verification (if audio available)
+    if audio_path and new_timings:
+        try:
+            audio_features = _load_audio_features(audio_path)
+            if audio_features:
+                hop_seconds = audio_features.hop_seconds
+                energy = audio_features.energy
+
+                onset = _find_word_onset(
+                    temp_word, energy, hop_seconds, features=audio_features,
+                )
+                offset = _find_word_offset(
+                    temp_word, energy, hop_seconds, features=audio_features,
+                )
+
+                if onset is not None and abs(onset - original_word.start) > 0.05:
+                    temp_word.start = onset
+                    new_timings = interpolate_character_timings(temp_word)
+                if offset is not None and abs(offset - original_word.end) > 0.05:
+                    temp_word.end = offset
+                    new_timings = interpolate_character_timings(temp_word)
+        except Exception:
+            pass  # Fall back to calculated timing
+
+    return new_timings
