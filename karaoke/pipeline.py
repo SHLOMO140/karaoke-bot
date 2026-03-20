@@ -24,7 +24,7 @@ from .exceptions import AudioExtractionError, DownloadError
 from .harmony import LibrosaHarmonyAnalyzer, render_chord_sheet_text
 from .job_manager import add_warning
 from .language_detector import WhisperLanguageDetector
-from .lyrics_verifier import HybridLyricsVerifier
+from .lyrics_verifier import HybridLyricsVerifier, MultiStepLyricsVerifier
 from .models import (
     Job,
     JobStatus,
@@ -66,7 +66,7 @@ class KaraokePipeline:
         self.separator = separator or DemucsSeparator()
         self.language_detector = language_detector or WhisperLanguageDetector()
         self.transcriber = transcriber or FasterWhisperHebrewProvider()
-        self.lyrics_verifier = lyrics_verifier or HybridLyricsVerifier()
+        self.lyrics_verifier = lyrics_verifier or MultiStepLyricsVerifier()
         self.aligner = aligner or get_alignment_provider()
         self.song_analyzer = song_analyzer or LibrosaHarmonyAnalyzer()
         self.srt_renderer = srt_renderer or SrtRenderer()
@@ -169,6 +169,11 @@ class KaraokePipeline:
         job_manager.save_song_analysis(self.job, analysis)
         job_manager.save_chord_sheet(self.job, render_chord_sheet_text(self.job.display_name, segments, analysis))
         return analysis
+
+    def step_post_review(self, job: Job, original_draft: TranscriptDraft):
+        """Run Steps 5-7 after human approval (char diff, Gemini validate, timing fix)."""
+        if hasattr(self.lyrics_verifier, 'post_review_steps'):
+            self.lyrics_verifier.post_review_steps(job, original_draft)
 
     def run_until_review(self, input_path: str | None = None) -> TranscriptDraft:
         audio_path = self.step_get_audio(input_path)

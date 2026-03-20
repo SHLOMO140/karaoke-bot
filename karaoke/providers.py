@@ -7,6 +7,7 @@ from typing import Protocol
 
 from .models import (
     AlignedTranscript,
+    Job,
     KaraokeStyle,
     LanguageDetectionResult,
     LyricsVerificationResult,
@@ -54,6 +55,14 @@ class LyricsVerifier(Protocol):
 
     def verify(self, title: str, draft: TranscriptDraft) -> LyricsVerificationResult:
         ...
+
+
+class MultiStepLyricsVerifierProtocol(Protocol):
+    name: str
+
+    def verify(self, title: str, draft: TranscriptDraft) -> LyricsVerificationResult: ...
+
+    def post_review_steps(self, job: "Job", original_draft: TranscriptDraft) -> None: ...
 
 
 class SubtitleRenderer(Protocol):
