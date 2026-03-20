@@ -34,6 +34,8 @@ KNOWN_LYRICS_DOMAINS = (
     "shirrim.com",
     "genius.com",
     "nomorelyrics.net",
+    "baneshama.co.il",
+    "nagina.co.il",
 )
 SITE_QUERY_DOMAINS = (
     "shironet.mako.co.il",
@@ -42,6 +44,8 @@ SITE_QUERY_DOMAINS = (
     "lyricstranslate.com",
     "nli.org.il",
     "genius.com",
+    "baneshama.co.il",
+    "nagina.co.il",
 )
 PREFERRED_LYRICS_DOMAINS = (
     "shironet.mako.co.il",
@@ -406,6 +410,25 @@ def _extract_site_specific_lyrics(url: str, page_html: str) -> str | None:
     # nomorelyrics.net – lyrics inside element with id/class "songtext"
     if "nomorelyrics" in domain:
         match = re.search(r'(?:id|class)=["\']songtext["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    # baneshama.co.il – Hebrew lyrics site
+    if "baneshama" in domain:
+        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r'class=["\'][^"\']*song[_-]?text[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    # nagina.co.il – Nagina Mizrahit, Mizrahi/Eastern music lyrics site
+    # Guard against matching nagnu.co.il which has its own parser above
+    if "nagina" in domain and "nagnu" not in domain:
+        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r'class=["\'][^"\']*song[_-]?content[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
         if match:
             return match.group(1)
 
