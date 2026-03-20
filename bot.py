@@ -11,11 +11,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from karaoke import job_manager
-from karaoke.config import BASE_DIR, TELEGRAM_BOT_TOKEN
+from karaoke.config import BASE_DIR, TELEGRAM_BOT_TOKEN, MAX_REVIEW_ITERATIONS
 from karaoke.error_formatter import format_pipeline_error, format_unexpected_error
 from karaoke.exceptions import DeliveryError, PipelineError
 from karaoke.legacy_media import download_audio, download_audio_karaoke, download_video, safe_filename, search_youtube
-from karaoke.models import Job, JobStatus, ReviewStatus, STATUS_MESSAGES, VideoRequest
+from karaoke.models import Job, JobStatus, ReviewStatus, STATUS_MESSAGES, VideoRequest, ConsensusResult, DisputedLine, VerificationVerdict
 from karaoke.pipeline import KaraokePipeline
 
 LOG_DIR = BASE_DIR / "logs"
@@ -186,12 +186,40 @@ def _build_review_text(job: Job, note: str | None = None) -> str:
         blocks.append(note)
 
     if verification:
+        verdict = str(verification.get("verdict", "")).strip()
         summary = str(verification.get("summary", "")).strip()
         confidence = float(verification.get("confidence", 0.0) or 0.0)
         correction_count = int(verification.get("correction_count", 0) or 0)
         applied = bool(verification.get("applied", False))
-        if summary:
+
+        # New consensus-aware display
+        consensus_data = verification.get("consensus_result")
+        if consensus_data and isinstance(consensus_data, dict):
+            if consensus_data.get("consensus_reached"):
+                agreed = consensus_data.get("agreed_sources", 0)
+                blocks.append(f"✅ מילים אומתו מ-{agreed} מקורות")
+            else:
+                # Show disputes
+                disputes = consensus_data.get("disputes", [])
+                if disputes:
+                    dispute_lines = ["⚠️ נמצאו הבדלים בין המקורות:"]
+                    for d in disputes[:5]:  # Limit to 5 disputes to avoid message overflow
+                        line_num = d.get("line_number", 0) + 1
+                        versions = d.get("versions", {})
+                        gemini_rec = d.get("gemini_recommendation", "")
+                        gemini_conf = d.get("gemini_confidence", 0.0)
+                        dispute_lines.append(f"שורה {line_num}: ⚠️")
+                        for src, ver in versions.items():
+                            dispute_lines.append(f"  ├─ {src}: \"{ver}\"")
+                        if gemini_rec:
+                            pct = int(gemini_conf * 100)
+                            dispute_lines.append(f"  └─ Gemini: \"{gemini_rec}\" ({pct}%)")
+                    blocks.append("\n".join(dispute_lines))
+                elif summary:
+                    blocks.append(f"אימות: {summary}")
+        elif summary:
             blocks.append(f"אימות לפני review: {summary}")
+
         if confidence:
             blocks.append(f"ציון התאמה לרשת: {confidence:.2f}")
         if applied and correction_count:
