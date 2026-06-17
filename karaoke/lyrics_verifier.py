@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
@@ -12,12 +13,20 @@ from urllib.error import HTTPError
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-from .models import LyricsVerificationResult, TranscriptDraft, VerificationVerdict, ConsensusResult
+from .models import (
+    ConsensusResult,
+    LyricsVerificationResult,
+    TranscriptDraft,
+    TranscriptSegment,
+    VerificationVerdict,
+    WordTiming,
+)
 
 logger = logging.getLogger(__name__)
 
 DUCKDUCKGO_HTML_SEARCH = "https://html.duckduckgo.com/html/?q={query}"
 DUCKDUCKGO_HTML_FALLBACK = "https://duckduckgo.com/html/?q={query}"
+BING_HTML_SEARCH = "https://www.bing.com/search?q={query}&setlang=he"
 SEARCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -67,6 +76,7 @@ SOURCE_DISPLAY_NAMES = {
     "tab4u.com": "Tab4U",
     "nagnu.co.il": "נגינה",
     "gemini": "Gemini",
+    "grok": "Grok",
 }
 STOPWORDS = {
     "של",
@@ -100,9 +110,18 @@ STOPWORDS = {
     "מן",
 }
 
-TITLE_RE = re.compile(r'<a[^>]+class="result__a"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>', re.S)
-SNIPPET_RE = re.compile(r'<a[^>]+class="result__snippet"[^>]*>(?P<snippet>.*?)</a>', re.S)
+TITLE_RE = re.compile(
+    r'<a(?=[^>]*class=["\'][^"\']*result__a[^"\']*["\'])(?=[^>]*href=["\'](?P<href>[^"\']+)["\'])[^>]*>(?P<title>.*?)</a>',
+    re.S | re.I,
+)
+SNIPPET_RE = re.compile(
+    r'<(?:a|div|span)(?=[^>]*class=["\'][^"\']*result__snippet[^"\']*["\'])[^>]*>(?P<snippet>.*?)</(?:a|div|span)>',
+    re.S | re.I,
+)
 SEARCH_RESULT_CACHE: dict[str, list["SearchResult"]] = {}
+SUPPORTED_LYRICS_LLM_PROVIDERS = {"gemini", "grok"}
+HEBREW_LYRICS_QUERY = "\u05de\u05d9\u05dc\u05d9\u05dd"
+HEBREW_LYRICS_FOR_SONG_QUERY = "\u05de\u05d9\u05dc\u05d9\u05dd \u05dc\u05e9\u05d9\u05e8"
 
 
 @dataclass
@@ -121,6 +140,25 @@ class LyricsSourceCandidate:
     excerpt: str
     lines: list[str]
     correction_count: int
+
+
+def _normalize_lyrics_llm_provider(provider: str) -> str:
+    normalized = (provider or "gemini").strip().lower()
+    if normalized in {"xai", "grok"}:
+        return "grok"
+    if normalized not in SUPPORTED_LYRICS_LLM_PROVIDERS:
+        logger.warning("Unsupported lyrics LLM provider '%s', falling back to Gemini", provider)
+        return "gemini"
+    return normalized
+
+
+def _lyrics_llm_display_name(provider: str) -> str:
+    normalized = _normalize_lyrics_llm_provider(provider)
+    return SOURCE_DISPLAY_NAMES.get(normalized, normalized.title())
+
+
+def _lyrics_llm_source_option_id(provider: str) -> str:
+    return f"source_{_normalize_lyrics_llm_provider(provider)}"
 
 
 def _strip_html(text: str) -> str:
@@ -155,6 +193,11 @@ def _tokenize_words(text: str) -> list[str]:
     return [token for token in re.findall(r"[\w\u0590-\u05FF']+", text) if len(_normalize_token(token)) >= 2]
 
 
+def _line_signature(text: str) -> str:
+    normalized_tokens = [_normalize_token(token) for token in _tokenize_words(text)]
+    return " ".join(token for token in normalized_tokens if token)
+
+
 def _top_keywords(text: str, limit: int = 10) -> list[str]:
     counts: dict[str, int] = {}
     for token in _tokenize(text):
@@ -163,6 +206,35 @@ def _top_keywords(text: str, limit: int = 10) -> list[str]:
         counts[token] = counts.get(token, 0) + 1
     ranked = sorted(counts.items(), key=lambda item: (-item[1], -len(item[0]), item[0]))
     return [token for token, _count in ranked[:limit]]
+
+
+def _draft_search_snippets(draft_text: str, limit: int = 3) -> list[str]:
+    lines = [line.strip() for line in draft_text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    counts: dict[str, int] = {}
+    snippets: dict[str, str] = {}
+    first_seen: dict[str, int] = {}
+    token_lengths: dict[str, int] = {}
+
+    for index, line in enumerate(lines):
+        tokens = _tokenize_words(line)
+        if len(tokens) < 3:
+            continue
+        signature = _line_signature(line)
+        if not signature:
+            continue
+        counts[signature] = counts.get(signature, 0) + 1
+        snippets.setdefault(signature, " ".join(tokens[: min(6, len(tokens))]))
+        first_seen.setdefault(signature, index)
+        token_lengths[signature] = max(token_lengths.get(signature, 0), len(tokens))
+
+    ranked = sorted(
+        counts,
+        key=lambda signature: (-counts[signature], -token_lengths[signature], first_seen[signature]),
+    )
+    return [snippets[signature] for signature in ranked[:limit]]
 
 
 def _normalize_title_text(text: str) -> str:
@@ -644,10 +716,12 @@ def _build_draft_only_result(
     summary: str,
     verdict: str = "not_run",
     search_query: str = "",
+    llm_provider: str = "",
 ) -> LyricsVerificationResult:
     draft_lines = _draft_lines(draft)
     return LyricsVerificationResult(
         provider=provider,
+        llm_provider=llm_provider,
         verdict=verdict,
         confidence=0.0,
         search_query=search_query,
@@ -670,6 +744,94 @@ def _build_draft_only_result(
             }
         ],
     )
+
+
+def _build_verification_options(
+    draft: TranscriptDraft,
+    *,
+    verified_lines: list[str] | None = None,
+    verified_label: str = "גרסה מאומתת",
+    verified_confidence: float = 0.0,
+    verified_source_count: int = 0,
+    verified_source_url: str = "",
+    verified_option_id: str = "verified",
+    verified_source_option_id: str | None = None,
+    verified_source_label: str | None = None,
+    supporting_sources: list[str] | None = None,
+    extra_source_options: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    draft_lines = _draft_lines(draft)
+    options: list[dict[str, object]] = [
+        {
+            "option_id": "draft",
+            "label": "תמלול מקורי",
+            "lines": draft_lines,
+            "source_url": "",
+            "confidence": 1.0,
+            "source_count": 0,
+        }
+    ]
+
+    normalized_verified_lines = [str(line).strip() for line in verified_lines or [] if str(line).strip()]
+    if normalized_verified_lines:
+        verified_option = {
+            "option_id": verified_option_id,
+            "label": verified_label,
+            "lines": normalized_verified_lines,
+            "source_url": verified_source_url,
+            "confidence": round(verified_confidence, 3),
+            "source_count": verified_source_count,
+        }
+        if supporting_sources:
+            verified_option["supporting_sources"] = list(dict.fromkeys(supporting_sources))
+        options.insert(0, verified_option)
+
+        if verified_source_option_id and verified_source_label:
+            options.append(
+                {
+                    "option_id": verified_source_option_id,
+                    "label": verified_source_label,
+                    "lines": normalized_verified_lines,
+                    "source_url": verified_source_url,
+                    "confidence": round(verified_confidence, 3),
+                    "source_count": max(1, verified_source_count),
+                }
+            )
+
+    for option in extra_source_options or []:
+        if option.get("option_id") and option.get("lines"):
+            options.append(option)
+
+    return options
+
+
+def _line_sets_differ(left: list[str], right: list[str]) -> bool:
+    normalized_left = [line.strip() for line in left if line.strip()]
+    normalized_right = [line.strip() for line in right if line.strip()]
+    return normalized_left != normalized_right
+
+
+def _estimate_line_corrections(draft: TranscriptDraft, corrected_lines: list[str]) -> int:
+    draft_lines = _draft_lines(draft)
+    corrected = [str(line).strip() for line in corrected_lines if str(line).strip()]
+    paired_differences = sum(1 for left, right in zip(draft_lines, corrected) if left != right)
+    return paired_differences + abs(len(draft_lines) - len(corrected))
+
+
+def _should_auto_apply_verified_lines(
+    draft: TranscriptDraft,
+    corrected_lines: list[str],
+    confidence: float,
+    *,
+    threshold: float,
+) -> bool:
+    draft_lines = _draft_lines(draft)
+    normalized_corrected = [str(line).strip() for line in corrected_lines if str(line).strip()]
+    if not normalized_corrected:
+        return False
+    if not _line_sets_differ(draft_lines, normalized_corrected):
+        return False
+    return confidence >= threshold
 
 
 def _looks_like_lyrics_result(result: SearchResult) -> bool:
@@ -948,7 +1110,7 @@ class DuckDuckGoLyricsVerifier:
                     "confidence": verified_confidence,
                     "source_count": len(supporting_sources),
                     "supporting_sources": supporting_sources,
-                },
+                }
             )
         for candidate in source_candidates[:3]:
             options.append(
@@ -998,7 +1160,6 @@ class DuckDuckGoLyricsVerifier:
             options=options,
         )
 
-
 class PreferredSiteLyricsVerifier(DuckDuckGoLyricsVerifier):
     name = "preferred_site_lyrics_verifier"
 
@@ -1015,6 +1176,7 @@ class PreferredSiteLyricsVerifier(DuckDuckGoLyricsVerifier):
 # ---------------------------------------------------------------------------
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+XAI_CHAT_API_URL = "https://api.x.ai/v1/chat/completions"
 
 GEMINI_LYRICS_PROMPT = """\
 אתה עוזר למצוא מילים מדויקות לשירים בעברית.
@@ -1080,48 +1242,149 @@ def _call_gemini(prompt: str, api_key: str, model: str, timeout: int = 25) -> st
     raise last_error  # type: ignore[misc]
 
 
+def _call_grok(prompt: str, api_key: str, model: str, timeout: int = 25) -> str:
+    """Call xAI's OpenAI-compatible chat completions endpoint and return text."""
+    import time
+
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert Hebrew lyrics verifier. Follow the user's requested output format exactly.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+            "stream": False,
+        }
+    ).encode("utf-8")
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            request = urllib.request.Request(
+                XAI_CHAT_API_URL,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            choices = result.get("choices", [])
+            if not choices:
+                return ""
+            message = choices[0].get("message", {})
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [
+                    str(part.get("text", "")).strip()
+                    for part in content
+                    if isinstance(part, dict) and str(part.get("type", "")).lower() == "text"
+                ]
+                return "\n".join(part for part in parts if part)
+            return str(content or "")
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code == 429 and attempt == 0:
+                logger.info("Grok rate limited, retrying in 5 seconds...")
+                time.sleep(5)
+                continue
+            raise
+        except Exception:
+            raise
+    raise last_error  # type: ignore[misc]
+
+
+def _call_lyrics_llm(prompt: str, provider: str, api_key: str, model: str, timeout: int = 25) -> str:
+    normalized = _normalize_lyrics_llm_provider(provider)
+    if normalized == "grok":
+        return _call_grok(prompt, api_key, model, timeout=timeout)
+    return _call_gemini(prompt, api_key, model, timeout=timeout)
+
+
 class GeminiLyricsVerifier:
-    """Lyrics verifier using Google Gemini AI to find and correct song lyrics."""
+    """Lyrics verifier backed by a configurable LLM provider."""
 
     name = "gemini_lyrics_verifier"
 
-    def __init__(self, api_key: str = "", model: str = "", fallback_verifier: DuckDuckGoLyricsVerifier | None = None):
-        from .config import GEMINI_API_KEY, GEMINI_MODEL
+    def __init__(
+        self,
+        api_key: str = "",
+        model: str = "",
+        fallback_verifier: DuckDuckGoLyricsVerifier | None = None,
+        provider: str = "",
+    ):
+        from .config import GEMINI_API_KEY, GEMINI_MODEL, LYRICS_LLM_PROVIDER, XAI_API_KEY, XAI_MODEL
 
-        self.api_key = api_key or GEMINI_API_KEY
-        self.model = model or GEMINI_MODEL
+        self.provider = _normalize_lyrics_llm_provider(provider or LYRICS_LLM_PROVIDER)
+        self.display_name = _lyrics_llm_display_name(self.provider)
+        self.name = f"{self.provider}_lyrics_verifier"
+        self.api_key = api_key or (XAI_API_KEY if self.provider == "grok" else GEMINI_API_KEY)
+        self.model = model or (XAI_MODEL if self.provider == "grok" else GEMINI_MODEL)
         self._fallback_verifier = fallback_verifier
 
     def _fallback_or_draft(self, title: str, draft: TranscriptDraft, summary: str, warnings: list[str]) -> LyricsVerificationResult:
+        summary = self._decorate_provider_text(summary)
         if self._fallback_verifier is not None:
-            return self._fallback_verifier.verify(title, draft)
+            result = self._fallback_verifier.verify(title, draft)
+            result.llm_provider = self.provider
+            return result
         return _build_draft_only_result(
             provider=self.name,
             draft=draft,
             warnings=warnings,
             summary=summary,
             verdict="mismatch",
-            search_query=f"Gemini: {title}",
+            search_query=f"{self.display_name}: {title}",
+            llm_provider=self.provider,
         )
 
-    def _parse_gemini_lines(self, raw_text: str) -> list[str]:
-        """Parse Gemini's response into clean lyrics lines.
+    def _decorate_provider_text(self, text: str) -> str:
+        if self.provider == "gemini" or not text:
+            return text
+        return text.replace("Gemini", self.display_name)
 
-        Strips any "THOUGHTS:" / reasoning prefix that some Gemini models
-        (e.g. gemini-2.5-flash) include before the actual lyrics.
-        """
+    def _retag_provider_result(self, result: LyricsVerificationResult) -> LyricsVerificationResult:
+        result.llm_provider = self.provider
+        if self.provider == "gemini":
+            return result
+
+        result.search_query = self._decorate_provider_text(result.search_query)
+        result.summary = self._decorate_provider_text(result.summary)
+        result.matched_sources = [self.provider if source == "gemini" else source for source in result.matched_sources]
+
+        for option in result.options:
+            label = option.get("label")
+            if isinstance(label, str):
+                option["label"] = self._decorate_provider_text(label)
+            if option.get("option_id") == "source_gemini":
+                option["option_id"] = _lyrics_llm_source_option_id(self.provider)
+            supporting_sources = option.get("supporting_sources")
+            if isinstance(supporting_sources, list):
+                option["supporting_sources"] = [
+                    self.provider if source == "gemini" else source
+                    for source in supporting_sources
+                ]
+
+        return result
+
+    def _parse_gemini_lines(self, raw_text: str) -> list[str]:
+        """Parse Gemini's response into clean lyrics lines."""
         text = raw_text.strip()
 
-        # Strip thinking block — everything before the actual lyrics.
-        # Gemini 2.5-flash sometimes prefixes with "THOUGHTS: ..." or
-        # "(Self-correction: ...)" blocks before the lyrics.
         for marker in ("THOUGHTS:", "Thoughts:", "thoughts:"):
             if text.startswith(marker):
-                # Find where lyrics actually begin — first line with Hebrew
                 for i, line in enumerate(text.splitlines()):
                     stripped = line.strip()
                     if stripped and re.search(r"[\u0590-\u05FF]", stripped):
-                        # Check it's not part of the thinking (no English preamble)
                         if not re.match(r"^[\(\[]", stripped):
                             text = "\n".join(text.splitlines()[i:])
                             break
@@ -1131,23 +1394,18 @@ class GeminiLyricsVerifier:
         in_thinking = False
         for line in text.splitlines():
             cleaned = line.strip()
-            # Skip empty lines
             if not cleaned:
                 continue
-            # Detect and skip thinking/reasoning blocks
             if cleaned.startswith(("THOUGHTS:", "Thoughts:", "thoughts:", "(Self-correction")):
                 in_thinking = True
                 continue
-            # End thinking on a line that has Hebrew and no English preamble
             if in_thinking:
                 if re.search(r"[\u0590-\u05FF]", cleaned) and not re.match(r"^[\(\[]", cleaned):
                     in_thinking = False
                 else:
                     continue
-            # Skip lines that look like headers/labels
             if cleaned.startswith(("```", "##", "**", "שם השיר", "מילים:", "לחן:", "Lyrics:")):
                 continue
-            # Only keep lines with Hebrew content
             if re.search(r"[\u0590-\u05FF]", cleaned):
                 lines.append(cleaned)
         return lines
@@ -1158,7 +1416,7 @@ class GeminiLyricsVerifier:
         warnings = _local_warnings(draft_text)
 
         if not self.api_key:
-            logger.info("No Gemini API key configured")
+            logger.info("No %s API key configured", self.display_name)
             return self._fallback_or_draft(title, draft, "Gemini לא זמין כרגע לבדיקת מילים.", warnings)
 
         try:
@@ -1166,23 +1424,21 @@ class GeminiLyricsVerifier:
                 title=title,
                 draft_text=draft_text,
             )
-            gemini_text = _call_gemini(prompt, self.api_key, self.model)
+            gemini_text = _call_lyrics_llm(prompt, self.provider, self.api_key, self.model)
             if not gemini_text.strip():
-                logger.info("Gemini returned empty response")
+                logger.info("%s returned empty response", self.display_name)
                 return self._fallback_or_draft(title, draft, "Gemini לא החזיר מילים שימושיות.", warnings)
 
             gemini_lines = self._parse_gemini_lines(gemini_text)
             if not gemini_lines:
-                logger.info("Gemini returned no Hebrew lyrics")
+                logger.info("%s returned no Hebrew lyrics", self.display_name)
                 return self._fallback_or_draft(title, draft, "Gemini לא זיהה שורות מילים בעברית.", warnings)
 
-            logger.info("Gemini returned %d lyrics lines for '%s'", len(gemini_lines), title[:40])
-
+            logger.info("%s returned %d lyrics lines for '%s'", self.display_name, len(gemini_lines), title[:40])
         except Exception as exc:
-            logger.warning("Gemini lyrics request failed: %s", exc)
+            logger.warning("%s lyrics request failed: %s", self.display_name, exc)
             return self._fallback_or_draft(title, draft, "Gemini נכשל בבקשת המילים לשיר.", warnings)
 
-        # Align Gemini's output against the draft segments
         gemini_tokens = [
             token
             for line in gemini_lines
@@ -1190,7 +1446,6 @@ class GeminiLyricsVerifier:
         ]
         corrected_lines, correction_count = _align_source_to_segments(gemini_tokens, draft)
 
-        # Score: compare Gemini's output to the draft
         draft_tokens = [_normalize_token(t) for t in _tokenize_words(draft_text)]
         gemini_norm = [_normalize_token(t) for t in gemini_tokens]
         if draft_tokens and gemini_norm:
@@ -1198,11 +1453,10 @@ class GeminiLyricsVerifier:
         else:
             score = 0.0
 
-        # Determine whether to apply corrections
         apply_corrections = bool(
             corrected_lines
             and correction_count > 0
-            and score >= 0.30  # Gemini's output must be at least 30% similar
+            and score >= 0.30
         )
         selected_option_id = "verified" if apply_corrections else "draft"
 
@@ -1253,7 +1507,7 @@ class GeminiLyricsVerifier:
         if apply_corrections:
             summary += f" בוצעו {correction_count} תיקוני מילים אוטומטיים."
 
-        return LyricsVerificationResult(
+        return self._retag_provider_result(LyricsVerificationResult(
             provider=self.name,
             verdict=verdict,
             confidence=round(score, 3),
@@ -1267,17 +1521,18 @@ class GeminiLyricsVerifier:
             applied=apply_corrections,
             selected_option_id=selected_option_id,
             options=options,
-        )
+        ))
 
 
 class HybridLyricsVerifier:
-    """Prefer Shironet/Tab4U/Nagnu, and use Gemini only if none provide usable lyrics."""
+    """Prefer Shironet/Tab4U/Nagnu, and use the configured LLM only if needed."""
 
     name = "hybrid_lyrics_verifier"
 
     def __init__(self):
         self.preferred = PreferredSiteLyricsVerifier()
         self.gemini = GeminiLyricsVerifier(fallback_verifier=None)
+        self.llm = self.gemini
 
     def verify(self, title: str, draft: TranscriptDraft) -> LyricsVerificationResult:
         preferred_result = self.preferred.verify(title, draft)
@@ -1299,79 +1554,216 @@ class HybridLyricsVerifier:
             "לא נמצאו מילים שימושיות בשירונט, Tab4U או נגינה, אז בוצע fallback ל-Gemini. "
             + gemini_result.summary
         )
+        gemini_result.summary = self.gemini._decorate_provider_text(gemini_result.summary)
         if not gemini_result.search_query:
             gemini_result.search_query = preferred_result.search_query
         return gemini_result
 
 
 class MultiStepLyricsVerifier:
-    """Multi-step lyrics verifier with parallel source search, consensus, and Gemini fallback."""
+    """Multi-step lyrics verifier with parallel source search and LLM fallback."""
 
     name = "multi_step_lyrics_verifier"
 
     def __init__(self):
-        from .config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID, GEMINI_API_KEY, GEMINI_MODEL
+        from .config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID, GEMINI_API_KEY, GEMINI_MODEL, LYRICS_LLM_PROVIDER, XAI_API_KEY, XAI_MODEL
         from .google_search import GoogleSearchProvider, YouTubeDescriptionProvider
         from .consensus import ConsensusEngine
 
         self._google = GoogleSearchProvider(api_key=GOOGLE_API_KEY, engine_id=GOOGLE_SEARCH_ENGINE_ID)
         self._youtube = YouTubeDescriptionProvider(api_key=GOOGLE_API_KEY)
         self._consensus = ConsensusEngine()
-        self._gemini_api_key = GEMINI_API_KEY
-        self._gemini_model = GEMINI_MODEL
+        self._llm_provider = _normalize_lyrics_llm_provider(LYRICS_LLM_PROVIDER)
+        self._llm_display_name = _lyrics_llm_display_name(self._llm_provider)
+        self._fallback_llm_provider = "gemini" if self._llm_provider != "gemini" and GEMINI_API_KEY else ""
+        self._fallback_llm_display_name = _lyrics_llm_display_name(self._fallback_llm_provider)
+        if self._llm_provider == "grok":
+            self._gemini_api_key = XAI_API_KEY
+            self._gemini_model = XAI_MODEL
+        else:
+            self._gemini_api_key = GEMINI_API_KEY
+            self._gemini_model = GEMINI_MODEL
+        self._fallback_api_key = GEMINI_API_KEY if self._fallback_llm_provider == "gemini" else ""
+        self._fallback_model = GEMINI_MODEL if self._fallback_llm_provider == "gemini" else ""
+        self._last_llm_provider_used = self._llm_provider
+        self._last_llm_warning = ""
+
+    def _decorate_llm_text(self, text: str, provider: str) -> str:
+        if provider == "gemini" or not text:
+            return text
+        return text.replace("Gemini", _lyrics_llm_display_name(provider))
+
+    def _retag_llm_result(
+        self,
+        result: LyricsVerificationResult,
+        *,
+        provider_used: str | None = None,
+    ) -> LyricsVerificationResult:
+        actual_provider = _normalize_lyrics_llm_provider(provider_used or self._llm_provider)
+        result.llm_provider = actual_provider
+        if actual_provider == "gemini":
+            return result
+
+        result.summary = self._decorate_llm_text(result.summary, actual_provider)
+        result.search_query = self._decorate_llm_text(result.search_query, actual_provider)
+        result.matched_sources = [actual_provider if source == "gemini" else source for source in result.matched_sources]
+        result.local_warnings = [self._decorate_llm_text(warning, actual_provider) for warning in result.local_warnings]
+
+        for option in result.options:
+            label = option.get("label")
+            if isinstance(label, str):
+                option["label"] = self._decorate_llm_text(label, actual_provider)
+            if option.get("option_id") == "source_gemini":
+                option["option_id"] = _lyrics_llm_source_option_id(actual_provider)
+            supporting_sources = option.get("supporting_sources")
+            if isinstance(supporting_sources, list):
+                option["supporting_sources"] = [
+                    actual_provider if source == "gemini" else source
+                    for source in supporting_sources
+                ]
+
+        return result
+
+    def _run_llm_prompt(self, prompt: str, *, timeout: int) -> str:
+        self._last_llm_provider_used = self._llm_provider
+        self._last_llm_warning = ""
+        try:
+            return _call_lyrics_llm(
+                prompt,
+                self._llm_provider,
+                self._gemini_api_key,
+                self._gemini_model,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            if self._fallback_llm_provider and self._fallback_api_key:
+                logger.warning(
+                    "%s failed for lyrics verification, retrying with %s: %s",
+                    self._llm_display_name,
+                    self._fallback_llm_display_name,
+                    exc,
+                )
+                response_text = _call_lyrics_llm(
+                    prompt,
+                    self._fallback_llm_provider,
+                    self._fallback_api_key,
+                    self._fallback_model,
+                    timeout=timeout,
+                )
+                self._last_llm_provider_used = self._fallback_llm_provider
+                self._last_llm_warning = (
+                    f"{self._llm_display_name} לא זמין כרגע, בוצע fallback ל-{self._fallback_llm_display_name}."
+                )
+                return response_text
+            raise
 
     def verify(self, title: str, draft: TranscriptDraft) -> LyricsVerificationResult:
-        """Main entry point: search sources, build consensus, fall back to Gemini if needed."""
-        # Step 1: Extract draft text
+        """Main entry point: search sources, build consensus, fall back to the configured LLM if needed."""
         draft_text = draft.text
+        draft_lines = _draft_lines(draft)
 
-        # Step 2: Search all sources
         try:
-            sources = self._search_all_sources(title, draft_text)
+            sources = self._search_all_sources(title, draft)
         except Exception as exc:
             logger.warning("Source search failed: %s", exc)
             sources = {}
 
-        # Step 3: Run consensus
         consensus = self._consensus.evaluate(sources)
+        merged_search_lines, merged_search_sources = _merge_search_source_versions(sources)
 
-        # Case A: Consensus reached (3+ sources agree on ALL lines)
         if consensus.consensus_reached and consensus.agreed_sources >= 3:
-            return LyricsVerificationResult(
+            correction_count = _estimate_line_corrections(draft, consensus.lyrics)
+            apply_corrections = _should_auto_apply_verified_lines(
+                draft,
+                consensus.lyrics,
+                0.95,
+                threshold=0.80,
+            )
+            return self._retag_llm_result(LyricsVerificationResult(
                 provider=self.name,
                 verdict=VerificationVerdict.CONSENSUS.value,
                 confidence=0.95,
                 corrected_lines=consensus.lyrics,
-                correction_count=0,
+                correction_count=correction_count,
+                applied=apply_corrections,
+                selected_option_id="verified" if apply_corrections else "draft",
+                options=_build_verification_options(
+                    draft,
+                    verified_lines=consensus.lyrics,
+                    verified_label=f"קונצנזוס בין {consensus.agreed_sources} מקורות",
+                    verified_confidence=0.95,
+                    verified_source_count=consensus.agreed_sources,
+                    supporting_sources=list(sources.keys()),
+                    extra_source_options=[
+                        option
+                        for option in [
+                            _build_search_merged_option(
+                                merged_search_lines,
+                                merged_search_sources,
+                                confidence=0.82,
+                                reference_lines=consensus.lyrics,
+                            )
+                        ]
+                        if option
+                    ],
+                ),
                 matched_sources=list(sources.keys()),
                 summary=f"קונצנזוס בין {consensus.agreed_sources} מקורות",
                 consensus_result=consensus,
                 source_versions=sources,
-            )
+            ))
 
-        # Case B: No sources found — use Gemini knowledge-based check
         if not sources:
             try:
                 lyrics, confidence = self._gemini_knowledge_verify(draft_text, title)
-                return LyricsVerificationResult(
+                provider_used = self._last_llm_provider_used
+                fallback_warning = self._last_llm_warning
+                normalized_lyrics = [str(line).strip() for line in lyrics if str(line).strip()]
+                correction_count = _estimate_line_corrections(draft, normalized_lyrics)
+                apply_corrections = _should_auto_apply_verified_lines(
+                    draft,
+                    normalized_lyrics,
+                    confidence,
+                    threshold=0.78,
+                )
+                return self._retag_llm_result(LyricsVerificationResult(
                     provider=self.name,
                     verdict=VerificationVerdict.NO_SOURCES.value,
                     confidence=confidence,
-                    corrected_lines=lyrics,
-                    correction_count=0,
+                    corrected_lines=normalized_lyrics,
+                    correction_count=correction_count,
+                    applied=apply_corrections,
+                    selected_option_id="verified" if apply_corrections else "draft",
+                    options=_build_verification_options(
+                        draft,
+                        verified_lines=normalized_lyrics,
+                        verified_label="אימות Gemini ללא מקורות",
+                        verified_confidence=confidence,
+                        verified_source_count=1,
+                        verified_source_option_id="source_gemini",
+                        verified_source_label="מקור: Gemini",
+                        supporting_sources=["gemini"],
+                    ),
                     matched_sources=[],
                     summary="לא נמצאו מקורות אונליין, בוצע אימות על בסיס ידע Gemini",
-                    local_warnings=["לא נמצאו מקורות מילים באינטרנט"],
+                    local_warnings=[
+                        warning
+                        for warning in [
+                            "לא נמצאו מקורות מילים באינטרנט",
+                            fallback_warning,
+                        ]
+                        if warning
+                    ],
                     consensus_result=consensus,
                     source_versions=sources,
-                )
+                ), provider_used=provider_used)
             except Exception as exc:
-                logger.warning("Gemini knowledge verify failed: %s", exc)
-                return LyricsVerificationResult(
+                logger.warning("%s knowledge verify failed: %s", self._llm_display_name, exc)
+                return self._retag_llm_result(LyricsVerificationResult(
                     provider=self.name,
                     verdict=VerificationVerdict.NO_SOURCES.value,
                     confidence=0.3,
-                    corrected_lines=draft_text.splitlines(),
+                    corrected_lines=draft_lines,
                     correction_count=0,
                     matched_sources=[],
                     summary="לא נמצאו מקורות ו-Gemini לא זמין",
@@ -1379,41 +1771,119 @@ class MultiStepLyricsVerifier:
                         "לא נמצאו מקורות מילים באינטרנט",
                         f"שגיאה בגישה ל-Gemini: {exc}",
                     ],
+                    selected_option_id="draft",
+                    options=_build_verification_options(draft),
                     consensus_result=consensus,
                     source_versions=sources,
-                )
+                ))
 
-        # Case C: Sources found but no consensus — Gemini decides
         try:
             lyrics, confidence, uncertain = self._gemini_deep_verify(
                 sources, consensus.disputes, title
             )
-            return LyricsVerificationResult(
+            provider_used = self._last_llm_provider_used
+            fallback_warning = self._last_llm_warning
+            correction_count = _estimate_line_corrections(draft, lyrics)
+            apply_corrections = _should_auto_apply_verified_lines(
+                draft,
+                lyrics,
+                confidence,
+                threshold=0.72,
+            )
+            source_options = [
+                {
+                    "option_id": f"source_{source_name}",
+                    "label": f"מקור: {SOURCE_DISPLAY_NAMES.get(source_name, source_name)}",
+                    "lines": lines,
+                    "source_url": "",
+                    "confidence": 0.75,
+                    "source_count": 1,
+                }
+                for source_name, lines in sources.items()
+                if lines
+            ]
+            search_merged_option = _build_search_merged_option(
+                merged_search_lines,
+                merged_search_sources,
+                confidence=max(0.58, min(confidence, 0.78)),
+                reference_lines=lyrics,
+            )
+            extra_source_options = []
+            if search_merged_option:
+                extra_source_options.append(search_merged_option)
+            extra_source_options.extend(source_options[:3])
+            return self._retag_llm_result(LyricsVerificationResult(
                 provider=self.name,
                 verdict=VerificationVerdict.GEMINI_VERIFIED.value,
                 confidence=confidence,
                 corrected_lines=lyrics,
-                correction_count=0,
+                correction_count=correction_count,
+                applied=apply_corrections,
+                selected_option_id="verified" if apply_corrections else "draft",
+                options=_build_verification_options(
+                    draft,
+                    verified_lines=lyrics,
+                    verified_label="הכרעת Gemini בין מקורות",
+                    verified_confidence=confidence,
+                    verified_source_count=max(1, len(sources)),
+                    verified_source_option_id="source_gemini",
+                    verified_source_label="מקור: Gemini",
+                    supporting_sources=["gemini", *sources.keys()],
+                    extra_source_options=extra_source_options,
+                ),
                 matched_sources=list(sources.keys()),
                 summary=f"Gemini הכריע בין {len(sources)} מקורות",
+                local_warnings=[*uncertain, *([fallback_warning] if fallback_warning else [])],
                 consensus_result=consensus,
                 source_versions=sources,
-            )
+            ), provider_used=provider_used)
         except Exception as exc:
-            logger.warning("Gemini deep verify failed: %s", exc)
-            # Fallback: return best available (consensus lyrics even without full agreement)
-            return LyricsVerificationResult(
+            logger.warning("%s deep verify failed: %s", self._llm_display_name, exc)
+            fallback_lines = merged_search_lines or consensus.lyrics
+            fallback_label = (
+                "תוצאת חיפוש משולבת"
+                if merged_search_lines
+                else "הגרסה הטובה ביותר מהמקורות"
+            )
+            fallback_summary = (
+                "Gemini לא זמין, הוחזרה תוצאת חיפוש משולבת מהמקורות"
+                if merged_search_lines
+                else "Gemini לא זמין, מוחזרת התוצאה הטובה ביותר מהמקורות"
+            )
+            fallback_source_count = len(merged_search_sources) if merged_search_lines else len(sources)
+            source_options = [
+                {
+                    "option_id": f"source_{source_name}",
+                    "label": f"מקור: {SOURCE_DISPLAY_NAMES.get(source_name, source_name)}",
+                    "lines": lines,
+                    "source_url": "",
+                    "confidence": 0.5,
+                    "source_count": 1,
+                }
+                for source_name, lines in list(sources.items())[:3]
+                if lines
+            ]
+            return self._retag_llm_result(LyricsVerificationResult(
                 provider=self.name,
                 verdict=VerificationVerdict.GEMINI_VERIFIED.value,
                 confidence=0.5,
-                corrected_lines=consensus.lyrics,
-                correction_count=0,
+                corrected_lines=fallback_lines,
+                correction_count=_estimate_line_corrections(draft, fallback_lines),
                 matched_sources=list(sources.keys()),
-                summary="Gemini לא זמין, מוחזר תוצאה הטובה ביותר מהמקורות",
+                summary=fallback_summary,
                 local_warnings=[f"שגיאה ב-Gemini: {exc}"],
+                selected_option_id="draft",
+                options=_build_verification_options(
+                    draft,
+                    verified_lines=fallback_lines,
+                    verified_label=fallback_label,
+                    verified_confidence=0.5,
+                    verified_source_count=fallback_source_count,
+                    extra_source_options=source_options,
+                ),
                 consensus_result=consensus,
                 source_versions=sources,
-            )
+            ))
 
     def _search_all_sources(self, title: str, draft_text: str) -> dict[str, list[str]]:
         """Search multiple sources in parallel and return source_name -> lyrics lines."""
@@ -1512,7 +1982,7 @@ class MultiStepLyricsVerifier:
         disputes: list,
         title: str,
     ) -> tuple[list[str], float, list[str]]:
-        """Call Gemini to decide which version is correct among disagreeing sources."""
+        """Call the configured LLM to decide which version is correct among disagreeing sources."""
         source_text = ""
         for source_name, lines in sources.items():
             source_text += f"\n--- מקור: {source_name} ---\n"
@@ -1544,7 +2014,7 @@ class MultiStepLyricsVerifier:
             f"LYRICS:\n<המילים הנכונות, שורה לשורה>"
         )
 
-        response_text = _call_gemini(prompt, self._gemini_api_key, self._gemini_model, timeout=30)
+        response_text = self._run_llm_prompt(prompt, timeout=30)
         return self._parse_gemini_response(response_text)
 
     def _gemini_knowledge_verify(
@@ -1552,7 +2022,7 @@ class MultiStepLyricsVerifier:
         whisper_text: str,
         title: str,
     ) -> tuple[list[str], float]:
-        """Call Gemini with Whisper transcript for knowledge-based verification."""
+        """Call the configured LLM with Whisper transcript for knowledge-based verification."""
         prompt = (
             f"אתה מומחה למילות שירים בעברית.\n"
             f"שם השיר: {title}\n\n"
@@ -1566,7 +2036,7 @@ class MultiStepLyricsVerifier:
             f"LYRICS:\n<המילים, שורה לשורה>"
         )
 
-        response_text = _call_gemini(prompt, self._gemini_api_key, self._gemini_model, timeout=30)
+        response_text = self._run_llm_prompt(prompt, timeout=30)
         lyrics, confidence, _ = self._parse_gemini_response(response_text)
         return lyrics, confidence
 
@@ -1607,3 +2077,1899 @@ class MultiStepLyricsVerifier:
     def post_review_steps(self, job, original_draft):
         """Placeholder for Steps 5-7, called from bot.py after user approval."""
         pass
+
+
+def _build_query_variants(title: str, draft_text: str) -> list[str]:
+    context = _extract_title_context(title)
+    clean_title = context["clean_title"]
+    hebrew_artist = context["hebrew_artist"]
+    latin_artist = context["latin_artist"]
+    song = context["song"]
+    keywords = _top_keywords(draft_text, limit=8)
+    keyword_tail = " ".join(keywords[:4])
+    lyric_snippets = _draft_search_snippets(draft_text, limit=3)
+
+    queries = []
+    if hebrew_artist and song:
+        queries.extend(
+            [
+                f"{hebrew_artist} {song} ׳׳™׳׳™׳",
+                f"{song} {hebrew_artist} ׳׳™׳׳™׳",
+                f"\"{hebrew_artist}\" \"{song}\" ׳׳™׳׳™׳",
+            ]
+        )
+    if latin_artist and song:
+        queries.extend(
+            [
+                f"\"{latin_artist}\" \"{song}\" lyrics",
+                f"{latin_artist} {song} lyrics",
+            ]
+        )
+    if clean_title:
+        queries.append(f"{clean_title} ׳׳™׳׳™׳")
+        queries.append(f"{clean_title} lyrics")
+    if song:
+        queries.append(f"\"{song}\" ׳׳™׳׳™׳")
+        queries.append(f"\"{song}\" lyrics")
+    for snippet in lyric_snippets[:2]:
+        if song:
+            queries.append(f"\"{song}\" \"{snippet}\" ׳׳™׳׳™׳")
+        queries.append(f"\"{snippet}\" ׳׳™׳׳™׳")
+    for domain in SITE_QUERY_DOMAINS:
+        suffix = "lyrics" if domain in {"genius.com", "lyricstranslate.com"} else "׳׳™׳׳™׳"
+        if hebrew_artist and song:
+            queries.append(f"site:{domain} \"{hebrew_artist}\" \"{song}\" {suffix}")
+        if latin_artist and song:
+            queries.append(f"site:{domain} \"{latin_artist}\" \"{song}\" {suffix}")
+        for snippet in lyric_snippets[:1]:
+            queries.append(f"site:{domain} \"{snippet}\" {suffix}")
+    if clean_title and keyword_tail:
+        queries.append(f"{clean_title} {keyword_tail}")
+    elif keyword_tail:
+        queries.append(f"{keyword_tail} ׳׳™׳׳™׳")
+
+    if keyword_tail:
+        queries.append(f"׳׳™׳׳™׳ ׳׳©׳™׳¨ {keyword_tail}")
+
+    return list(dict.fromkeys(query for query in queries if query.strip()))
+
+
+def _relax_search_queries(query: str) -> list[str]:
+    variants: list[str] = []
+
+    def _add(candidate: str) -> None:
+        normalized = " ".join(candidate.split())
+        if normalized and normalized not in variants:
+            variants.append(normalized)
+
+    _add(query)
+    _add(re.sub(r'"([^"]+)"', r"\1", query))
+    no_site = re.sub(r"\bsite:[^\s]+\s*", "", query)
+    _add(no_site)
+    _add(no_site.replace('"', ""))
+    return variants
+
+
+_PAGE_NOISE_KEYWORDS = {
+    "אקורדים",
+    "אקורד",
+    "מילים",
+    "מילים לשיר",
+    "מילים:",
+    "מילים ולחן",
+    "פרסומת",
+    "פרסומות",
+    "תגובות",
+    "תגובה",
+    "שתפו",
+    "שיתוף",
+    "פייסבוק",
+    "אינסטגרם",
+    "יוטיוב",
+    "וואטסאפ",
+    "לחצו",
+    "כניסה",
+    "הרשמה",
+    "חיפוש",
+    "תפריט",
+    "בית",
+    "ראשי",
+    "צפיות",
+    "צפה",
+    "להדפסה",
+    "הדפסה",
+    "האזנה",
+    "הורדה",
+}
+
+_YOUTUBE_CREDIT_PHRASES = {
+    "יחסי ציבור",
+    "תקשורת ויחסי ציבור",
+    "מילים ולחן",
+    "לחן ועיבוד",
+    "עיבוד והפקה",
+    "עריכה דיגיטלית",
+    "הפצה דיגיטלית",
+    "הפצה דיגטלית",
+    "ניהול אישי",
+    "public relations",
+    "digital editing",
+    "digital distribution",
+    "mix and master",
+    "mix master",
+}
+
+_YOUTUBE_CREDIT_ROLE_WORDS = {
+    "עיבוד",
+    "הפקה",
+    "תופים",
+    "קלידים",
+    "תכנות",
+    "תכנותים",
+    "גיטרות",
+    "גיטרה",
+    "בס",
+    "בוזוקי",
+    "פסנתר",
+    "כינור",
+    "כינורות",
+    "סקסופון",
+    "חצוצרה",
+    "טרומבון",
+    "חליל",
+    "קולות",
+    "סטיילינג",
+    "איפור",
+    "צילום",
+    "בימוי",
+    "עריכה",
+    "גרפיקה",
+    "מיקס",
+    "מאסטר",
+    "הפצה",
+    "drums",
+    "keys",
+    "keyboards",
+    "programming",
+    "guitars",
+    "guitar",
+    "bass",
+    "bouzouki",
+    "piano",
+    "violin",
+    "violins",
+    "saxophone",
+    "trumpet",
+    "trombone",
+    "flute",
+    "vocals",
+    "styling",
+    "makeup",
+    "photo",
+    "video",
+    "editing",
+    "graphics",
+    "mix",
+    "master",
+    "management",
+    "distribution",
+    "producer",
+    "production",
+}
+
+_YOUTUBE_LYRIC_GUARD_WORDS = {
+    "אני",
+    "את",
+    "אתה",
+    "אתם",
+    "אתן",
+    "הוא",
+    "היא",
+    "אנחנו",
+    "לי",
+    "לך",
+    "לו",
+    "לה",
+    "שלי",
+    "שלך",
+    "שלו",
+    "שלה",
+    "אותי",
+    "אותך",
+    "אותו",
+    "אותה",
+    "איתי",
+    "איתך",
+    "עליי",
+    "עליך",
+    "עליו",
+    "עליה",
+}
+
+
+def _line_token_overlap(left: str, right: str) -> float:
+    left_tokens = {token for token in _line_signature(left).split() if token}
+    right_tokens = {token for token in _line_signature(right).split() if token}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+
+
+def _looks_like_noise_line(line: str) -> bool:
+    normalized = _line_signature(line)
+    if not normalized:
+        return True
+    if len(normalized.split()) > 14 or len(normalized.replace(" ", "")) > 80:
+        return True
+    if re.search(r"(?:^|[^\d])(?:0\d[\s\-]*){4,}\d(?:$|[^\d])|\d{7,}", line):
+        return True
+    if re.search(
+        r"(?:\u05de\u05d9\u05dc\u05d9\u05dd\s+\u05d5\u05dc\u05d7\u05df|"
+        r"\u05dc\u05d7\u05df\s+\u05d5\u05e2\u05d9\u05d1\u05d5\u05d3|"
+        r"\u05e2\u05d9\u05d1\u05d5\u05d3\s+\u05d5\u05d4\u05e4\u05e7\u05d4|"
+        r"\u05dc\u05d4\u05d5\u05e4\u05e2\u05d5\u05ea|"
+        r"\u05d4\u05e4\u05e7\u05d4|"
+        r"\u05e6\u05d9\u05dc\u05d5\u05dd|"
+        r"\u05d2\u05e8\u05e4\u05d9\u05e7\u05d4|"
+        r"\u05de\u05d9\u05e7\u05e1|"
+        r"\u05de\u05d0\u05e1\u05d8\u05e8)",
+        normalized,
+    ):
+        return True
+    if re.search(r"https?://|www\.|[@#]|[A-Za-z]{8,}", line):
+        return True
+    return any(keyword in normalized for keyword in _PAGE_NOISE_KEYWORDS)
+
+
+def _looks_like_youtube_credit_line(line: str) -> bool:
+    normalized = _line_signature(line)
+    if not normalized:
+        return False
+
+    words = normalized.split()
+    if len(words) > 8:
+        return False
+
+    if any(phrase in normalized for phrase in _YOUTUBE_CREDIT_PHRASES):
+        return True
+
+    if "להופעות" in normalized or "להזמנות" in normalized:
+        return True
+
+    first_word = words[0]
+    remaining_words = words[1:]
+    if first_word in _YOUTUBE_CREDIT_ROLE_WORDS:
+        if not remaining_words:
+            return True
+        if not any(word in _YOUTUBE_LYRIC_GUARD_WORDS for word in remaining_words):
+            return True
+
+    return False
+
+
+def _trim_youtube_credit_edges(lines: list[str]) -> list[str]:
+    normalized_lines = [str(line).strip() for line in lines if str(line).strip()]
+    if not normalized_lines:
+        return []
+
+    start_index = 0
+    end_index = len(normalized_lines)
+
+    while start_index < end_index and _looks_like_youtube_credit_line(normalized_lines[start_index]):
+        start_index += 1
+
+    while end_index > start_index and _looks_like_youtube_credit_line(normalized_lines[end_index - 1]):
+        end_index -= 1
+
+    if start_index >= end_index:
+        return []
+
+    return [
+        line
+        for line in normalized_lines[start_index:end_index]
+        if not _looks_like_youtube_credit_line(line)
+    ]
+
+
+def _clean_youtube_description_text(text: str) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _looks_like_youtube_credit_line(line):
+            continue
+        if re.search(r"https?://|www\.|[@#]", line):
+            continue
+        if re.search(r"(?:^|[^\d])(?:0\d[\s\-]*){4,}\d(?:$|[^\d])|\d{7,}", line):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _best_draft_line_stats(candidate_line: str, draft_lines: list[str]) -> tuple[float, float]:
+    if not draft_lines:
+        return 0.0, 0.0
+    similarities = [_line_similarity(candidate_line, draft_line) for draft_line in draft_lines]
+    overlaps = [_line_token_overlap(candidate_line, draft_line) for draft_line in draft_lines]
+    return max(similarities, default=0.0), max(overlaps, default=0.0)
+
+
+def _extract_candidate_lyrics_line_entries(
+    page_html: str,
+    draft_lines: list[str] | None = None,
+) -> list[tuple[str, list[str]]]:
+    cleaned = _strip_html_preserving_lines(page_html)
+    lines: list[tuple[str, list[str]]] = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line or _looks_like_noise_line(line):
+            continue
+        tokens = _tokenize_words(line)
+        hebrew_tokens = [token for token in tokens if re.search(r"[\u0590-\u05FF]", token)]
+        if len(hebrew_tokens) < 2 or len(hebrew_tokens) > 14:
+            continue
+        normalized_line = " ".join(hebrew_tokens)
+        if draft_lines:
+            similarity, overlap = _best_draft_line_stats(normalized_line, draft_lines)
+            if similarity < 0.22 and overlap < 0.34:
+                continue
+        lines.append((normalized_line, hebrew_tokens))
+    return lines
+
+
+def _line_similarity(left: str, right: str) -> float:
+    left_tokens = [token for token in _line_signature(left).split() if token]
+    right_tokens = [token for token in _line_signature(right).split() if token]
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return SequenceMatcher(None, left_tokens, right_tokens, autojunk=False).ratio()
+
+
+def _is_substantial_lyrics_line(line: str) -> bool:
+    signature = _line_signature(line)
+    word_count = len(signature.split())
+    char_count = len(signature.replace(" ", ""))
+    return word_count >= 3 or char_count >= 10
+
+
+def _build_repeat_anchor_map(lines: list[str]) -> dict[int, int]:
+    anchors: dict[int, int] = {}
+    similarity_cache: dict[tuple[int, int], float] = {}
+
+    def _sim(left_index: int, right_index: int) -> float:
+        key = (left_index, right_index)
+        if key not in similarity_cache:
+            similarity_cache[key] = _line_similarity(lines[left_index], lines[right_index])
+        return similarity_cache[key]
+
+    for right_start in range(1, len(lines)):
+        for left_start in range(right_start):
+            if _sim(left_start, right_start) < 0.84:
+                continue
+            run_length = 0
+            while (
+                right_start + run_length < len(lines)
+                and left_start + run_length < right_start
+                and _sim(left_start + run_length, right_start + run_length) >= 0.84
+            ):
+                run_length += 1
+            if run_length < 2:
+                continue
+            for offset in range(run_length):
+                anchors.setdefault(right_start + offset, left_start + offset)
+
+    for right_index in range(1, len(lines)):
+        if right_index in anchors or not _is_substantial_lyrics_line(lines[right_index]):
+            continue
+        for left_index in range(right_index):
+            if _sim(left_index, right_index) >= 0.96:
+                anchors[right_index] = left_index
+                break
+
+    return anchors
+
+
+def _expand_repeated_candidate_lines(draft_lines: list[str], candidate_lines: list[str]) -> list[str]:
+    normalized_draft = [line.strip() for line in draft_lines if line.strip()]
+    normalized_candidate = [str(line).strip() for line in candidate_lines if str(line).strip()]
+    if len(normalized_candidate) >= len(normalized_draft):
+        return normalized_candidate
+
+    anchor_map = _build_repeat_anchor_map(normalized_draft)
+    if not anchor_map:
+        return normalized_candidate
+
+    expanded: list[str] = []
+    assigned: dict[int, str] = {}
+    candidate_index = 0
+
+    for draft_index, draft_line in enumerate(normalized_draft):
+        current_line = normalized_candidate[candidate_index] if candidate_index < len(normalized_candidate) else None
+        if current_line is not None and _line_similarity(current_line, draft_line) >= 0.58:
+            chosen = current_line
+            candidate_index += 1
+        elif draft_index in anchor_map and anchor_map[draft_index] in assigned:
+            chosen = assigned[anchor_map[draft_index]]
+        else:
+            return normalized_candidate
+
+        expanded.append(chosen)
+        assigned[draft_index] = chosen
+
+    if candidate_index != len(normalized_candidate):
+        return normalized_candidate
+    return expanded
+
+
+def _choose_local_word_correction(
+    draft_word: str,
+    source_word: str,
+    *,
+    line_similarity: float,
+) -> tuple[str, bool]:
+    draft_norm = _normalize_token(draft_word)
+    source_norm = _normalize_token(source_word)
+    if not draft_norm:
+        return draft_word, False
+    if draft_norm == source_norm:
+        return source_word, False
+
+    word_similarity = SequenceMatcher(None, draft_norm, source_norm, autojunk=False).ratio()
+    shared_edge = (
+        draft_norm[:2] == source_norm[:2]
+        or draft_norm[-2:] == source_norm[-2:]
+    )
+
+    if word_similarity >= 0.5:
+        return source_word, True
+    if shared_edge and word_similarity >= 0.34:
+        return source_word, True
+    if line_similarity >= 0.82 and word_similarity >= 0.28 and abs(len(draft_norm) - len(source_norm)) <= 2:
+        return source_word, True
+    return draft_word, False
+
+
+def _repair_draft_line_from_source_line(draft_line: str, source_line: str) -> tuple[str, int]:
+    draft_words = _tokenize_words(draft_line)
+    source_words = _tokenize_words(source_line)
+    if not draft_words or not source_words:
+        return draft_line, 0
+
+    line_similarity = _line_similarity(draft_line, source_line)
+    overlap = _line_token_overlap(draft_line, source_line)
+    if line_similarity < 0.24 and overlap < 0.34:
+        return draft_line, 0
+
+    draft_norm = [_normalize_token(word) for word in draft_words]
+    source_norm = [_normalize_token(word) for word in source_words]
+    corrected_words: list[str] = []
+
+    for tag, a0, a1, b0, b1 in SequenceMatcher(None, draft_norm, source_norm, autojunk=False).get_opcodes():
+        if tag == "equal":
+            corrected_words.extend(source_words[b0:b1])
+            continue
+
+        if tag == "replace":
+            draft_chunk = draft_words[a0:a1]
+            source_chunk = source_words[b0:b1]
+            if len(draft_chunk) == len(source_chunk) and len(draft_chunk) <= 3:
+                replaced_chunk: list[str] = []
+                safe_chunk = True
+                for draft_word, source_word in zip(draft_chunk, source_chunk):
+                    chosen_word, changed = _choose_local_word_correction(
+                        draft_word,
+                        source_word,
+                        line_similarity=line_similarity,
+                    )
+                    if not changed and _normalize_token(draft_word) != _normalize_token(source_word):
+                        safe_chunk = False
+                        break
+                    replaced_chunk.append(chosen_word)
+                if safe_chunk:
+                    corrected_words.extend(replaced_chunk)
+                    continue
+
+        if tag in {"replace", "delete"}:
+            corrected_words.extend(draft_words[a0:a1])
+
+    corrected_line = " ".join(corrected_words).strip() or draft_line.strip()
+    correction_count = sum(
+        1
+        for left, right in zip(_tokenize_words(draft_line), _tokenize_words(corrected_line))
+        if _normalize_token(left) != _normalize_token(right)
+    )
+    return corrected_line, correction_count
+
+
+def _repair_draft_lines_from_source_lines(
+    draft_lines: list[str],
+    source_lines: list[str],
+) -> tuple[list[str], int]:
+    corrected_lines: list[str] = []
+    total_corrections = 0
+
+    for index, draft_line in enumerate(draft_lines):
+        source_line = source_lines[index] if index < len(source_lines) else ""
+        corrected_line, correction_count = _repair_draft_line_from_source_line(draft_line, source_line)
+        corrected_lines.append(corrected_line)
+        total_corrections += correction_count
+
+    return corrected_lines, total_corrections
+
+
+def _find_best_lyrics_window(page_html: str, draft: TranscriptDraft) -> tuple[float, list[str], int]:
+    draft_tokens = [_normalize_token(token) for token in _tokenize_words(draft.text)]
+    if not draft_tokens:
+        return 0.0, [], 0
+
+    draft_lines = _draft_lines(draft)
+    raw_lines = _extract_candidate_lyrics_line_entries(page_html, draft_lines)
+    if not raw_lines:
+        return 0.0, [], 0
+
+    draft_token_set = set(draft_tokens)
+    target_words = len(draft_tokens)
+    target_line_count = max(1, len(draft_lines))
+    min_window_lines = max(1, int(target_line_count * 0.5))
+    max_window_lines = max(min_window_lines, target_line_count + 5)
+
+    def _score_window(candidate_lines: list[tuple[str, list[str]]]) -> float:
+        normalized = [_normalize_token(token) for _line, tokens in candidate_lines for token in tokens]
+        if not normalized:
+            return 0.0
+        ratio = SequenceMatcher(None, draft_tokens, normalized, autojunk=False).ratio()
+        overlap = len(draft_token_set & set(normalized)) / max(1, len(draft_token_set))
+        line_coverage = min(len(candidate_lines), target_line_count) / max(
+            len(candidate_lines), target_line_count, 1
+        )
+        return ratio * 0.62 + overlap * 0.23 + line_coverage * 0.15
+
+    def _align_candidate_window(candidate_lines: list[tuple[str, list[str]]]) -> tuple[list[str], int]:
+        source_lines = [line for line, _tokens in candidate_lines]
+        expanded_lines = _expand_repeated_candidate_lines(draft_lines, source_lines)
+        return _repair_draft_lines_from_source_lines(draft_lines, expanded_lines)
+
+    if min_window_lines <= len(raw_lines) <= max_window_lines:
+        score = _score_window(raw_lines)
+        if score >= 0.45:
+            corrected_lines, correction_count = _align_candidate_window(raw_lines)
+            return score, corrected_lines, correction_count
+
+    best_score = 0.0
+    best_lines: list[tuple[str, list[str]]] = []
+
+    for start in range(len(raw_lines)):
+        collected: list[tuple[str, list[str]]] = []
+        collected_token_count = 0
+        max_end = min(len(raw_lines), start + max_window_lines)
+        for end in range(start, max_end):
+            collected.append(raw_lines[end])
+            collected_token_count += len(raw_lines[end][1])
+            window_line_count = end - start + 1
+            if collected_token_count > int(target_words * 1.65) + 10:
+                break
+            if window_line_count < min_window_lines:
+                continue
+            if collected_token_count < max(4, int(target_words * 0.5)):
+                continue
+
+            score = _score_window(collected)
+            if score > best_score:
+                best_score = score
+                best_lines = collected[:]
+
+    if not best_lines:
+        return 0.0, [], 0
+
+    corrected_lines, correction_count = _align_candidate_window(best_lines)
+    return best_score, corrected_lines, correction_count
+
+
+def _search_duckduckgo_results(query: str) -> list[SearchResult]:
+    cached = SEARCH_RESULT_CACHE.get(query)
+    if cached is not None:
+        return cached
+
+    last_error: Exception | None = None
+    for candidate_query in _relax_search_queries(query):
+        encoded_query = urllib.parse.quote_plus(candidate_query)
+        for endpoint in (DUCKDUCKGO_HTML_SEARCH, DUCKDUCKGO_HTML_FALLBACK):
+            try:
+                html_text = _fetch_text(endpoint.format(query=encoded_query))
+                results = _parse_duckduckgo_results(html_text)
+                if results:
+                    SEARCH_RESULT_CACHE[query] = results
+                    return results
+            except HTTPError as exc:
+                last_error = exc
+                logger.info("DuckDuckGo search endpoint failed for %s: %s", candidate_query, exc)
+                continue
+            except Exception as exc:
+                last_error = exc
+                logger.info("DuckDuckGo search parse failed for %s: %s", candidate_query, exc)
+                continue
+
+    if last_error:
+        logger.info("All DuckDuckGo search endpoints failed for %s: %s", query, last_error)
+    return []
+
+
+def _decode_bing_result_url(url: str) -> str:
+    unescaped = html.unescape(url)
+    parsed = urllib.parse.urlparse(unescaped)
+    params = urllib.parse.parse_qs(parsed.query)
+    encoded = params.get("u", [""])[0]
+    if encoded.startswith("a1"):
+        payload = encoded[2:]
+        padded = payload + "=" * (-len(payload) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+            return urllib.parse.unquote(decoded)
+        except Exception:
+            return unescaped
+    return unescaped
+
+
+def _parse_bing_results(html_text: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    for block in re.findall(r'<li class="b_algo".*?</li>', html_text, re.S):
+        title_match = re.search(r'<h2[^>]*>\s*<a[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>', block, re.S)
+        if not title_match:
+            continue
+        snippet_match = re.search(r'<p[^>]*>(?P<snippet>.*?)</p>', block, re.S)
+        url = _decode_bing_result_url(title_match.group("href"))
+        title = _strip_html(title_match.group("title"))
+        snippet = _strip_html(snippet_match.group("snippet")) if snippet_match else ""
+        if url:
+            results.append(SearchResult(title=title, snippet=snippet, url=url))
+    return results
+
+
+def _search_bing_results(query: str) -> list[SearchResult]:
+    cache_key = f"bing:{query}"
+    cached = SEARCH_RESULT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        html_text = _fetch_text(BING_HTML_SEARCH.format(query=urllib.parse.quote_plus(query)), timeout=15)
+        results = _parse_bing_results(html_text)
+        if results:
+            SEARCH_RESULT_CACHE[cache_key] = results
+            return results
+    except Exception as exc:
+        logger.info("Bing search failed for %s: %s", query, exc)
+    return []
+
+
+def _search_web_results(query: str) -> list[SearchResult]:
+    results = _search_duckduckgo_results(query)
+    if results:
+        return results
+    return _search_bing_results(query)
+
+
+def _build_synthetic_draft_from_text(text: str) -> TranscriptDraft:
+    segments: list[TranscriptSegment] = []
+    cursor = 0.0
+    for line in [line.strip() for line in text.splitlines() if line.strip()]:
+        tokens = _tokenize_words(line)
+        if not tokens:
+            continue
+        duration = max(0.3, 0.32 * len(tokens))
+        step = duration / max(len(tokens), 1)
+        words = [
+            WordTiming(
+                word=token,
+                start=cursor + index * step,
+                end=cursor + (index + 1) * step,
+                confidence=0.0,
+                source="draft_text",
+            )
+            for index, token in enumerate(tokens)
+        ]
+        segments.append(
+            TranscriptSegment(
+                words=words,
+                text=line,
+                start=cursor,
+                end=cursor + duration,
+            )
+        )
+        cursor += duration
+    return TranscriptDraft(segments=segments, provider="synthetic")
+
+
+def _coerce_search_draft(draft_or_text: TranscriptDraft | str) -> TranscriptDraft:
+    if isinstance(draft_or_text, TranscriptDraft):
+        return draft_or_text
+    return _build_synthetic_draft_from_text(draft_or_text)
+
+
+def _multistep_search_all_sources_override(
+    self,
+    title: str,
+    draft_or_text: TranscriptDraft | str,
+) -> dict[str, list[str]]:
+    import concurrent.futures
+
+    draft = _coerce_search_draft(draft_or_text)
+    draft_text = draft.text
+    draft_lines = _draft_lines(draft)
+    queries = _build_query_variants(title, draft_text)
+    context = _extract_title_context(title)
+    sources: dict[str, tuple[float, list[str]]] = {}
+    urls_by_domain: dict[str, list[str]] = {}
+    google_failed = False
+
+    def _remember_result(result) -> None:
+        url = getattr(result, "url", "")
+        if not url:
+            return
+        domain = _domain_from_url(url)
+        if not any(domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS):
+            return
+        if not _looks_like_lyrics_result(result):
+            return
+        if not _matches_title_context(result, context):
+            haystack = f"{getattr(result, 'title', '')} {getattr(result, 'snippet', '')}"
+            if _text_overlap_score(set(_top_keywords(context["song"], limit=4)), haystack) < 0.25:
+                return
+        domain_urls = urls_by_domain.setdefault(domain, [])
+        if url not in domain_urls and len(domain_urls) < 2:
+            domain_urls.append(url)
+
+    for query in queries[:5]:
+        try:
+            results = self._google.search(query, num=10)
+            for result in results:
+                _remember_result(result)
+        except Exception as exc:
+            logger.warning("Google search failed for query '%s': %s", query, exc)
+            if "429" in str(exc):
+                google_failed = True
+                break
+
+    if google_failed or len(urls_by_domain) < 2:
+        for query in queries[:5]:
+            try:
+                results = _search_web_results(query)
+                for result in results:
+                    _remember_result(result)
+            except Exception as exc:
+                logger.warning("Web fallback search failed: %s", exc)
+
+    def _fetch_and_parse(url: str) -> tuple[str, list[str], float]:
+        source_key = _domain_option_key(url)
+        try:
+            html_body = _fetch_text(url, timeout=15)
+            if _is_bot_blocked(html_body):
+                return source_key, [], 0.0
+
+            specific = _extract_site_specific_lyrics(url, html_body)
+            effective_html = specific if specific else html_body
+            window_score, corrected_lines, _correction_count = _find_best_lyrics_window(effective_html, draft)
+            if corrected_lines and window_score >= 0.18:
+                return source_key, corrected_lines, window_score
+
+            if specific:
+                extracted_entries = _extract_candidate_lyrics_line_entries(specific, draft_lines)
+                extracted_lines = [line for line, _tokens in extracted_entries]
+                if extracted_lines and len(extracted_lines) <= len(draft_lines) + 2:
+                    expanded_lines = _expand_repeated_candidate_lines(draft_lines, extracted_lines)
+                    repaired_lines, repaired_corrections = _repair_draft_lines_from_source_lines(
+                        draft_lines,
+                        expanded_lines,
+                    )
+                    paired_scores = [
+                        max(_line_similarity(left, right), _line_token_overlap(left, right))
+                        for left, right in zip(draft_lines, repaired_lines)
+                    ]
+                    fallback_score = sum(paired_scores) / max(1, len(paired_scores))
+                    if repaired_corrections > 0 and fallback_score >= 0.48:
+                        return source_key, repaired_lines, fallback_score
+        except Exception as exc:
+            logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
+        return source_key, [], 0.0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(_fetch_and_parse, url): url
+            for domain_urls in urls_by_domain.values()
+            for url in domain_urls
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                key, lines, score = future.result()
+                if lines and (key not in sources or score > sources[key][0]):
+                    sources[key] = (score, lines)
+            except Exception as exc:
+                logger.warning("Source fetch error: %s", exc)
+
+    try:
+        yt_results = self._youtube.search(f"{title} ׳׳™׳׳™׳", max_results=3)
+        for yt_result in yt_results:
+            desc = yt_result.snippet
+            if desc and re.search(r"[\u0590-\u05FF]", desc):
+                lines = [
+                    line.strip()
+                    for line in desc.splitlines()
+                    if line.strip() and re.search(r"[\u0590-\u05FF]", line) and len(line.strip()) >= 2
+                ]
+                prepared_lines = _expand_repeated_candidate_lines(draft_lines, lines)
+                if len(prepared_lines) >= max(3, min(3, len(draft_lines))):
+                    sources[f"youtube_{yt_result.title[:20]}"] = (0.25, prepared_lines)
+                    break
+    except Exception as exc:
+        logger.warning("YouTube search failed: %s", exc)
+
+    return {source_name: lines for source_name, (_score, lines) in sources.items()}
+
+
+MultiStepLyricsVerifier._search_all_sources = _multistep_search_all_sources_override
+
+
+_PREVIOUS_EXTRACT_SITE_SPECIFIC_LYRICS = _extract_site_specific_lyrics
+_DIRECT_SITE_SEARCH_CACHE: dict[str, list[SearchResult]] = {}
+_SITEMAP_URL_CACHE: dict[str, list[str]] = {}
+_WEAK_CONTEXT_TOKENS = {"lyrics", "lyric", "song", "מילים", "שיר"}
+
+
+def _canonicalize_lyrics_source_url(url: str) -> str:
+    if not url:
+        return ""
+
+    normalized_url = url.strip()
+    if normalized_url.startswith(("tabs/", "lyrics/")):
+        normalized_url = urllib.parse.urljoin("https://www.tab4u.com/", normalized_url)
+
+    parsed = urllib.parse.urlparse(normalized_url)
+    if not parsed.netloc:
+        return normalized_url
+
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc
+    path = parsed.path or "/"
+    domain = netloc.lower().removeprefix("www.")
+
+    if domain == "tab4u.com":
+        path = path.replace("/tabs/songs/", "/lyrics/songs/")
+        return urllib.parse.urlunparse((scheme, netloc, path, "", "", ""))
+
+    if domain == "nagnu.co.il":
+        path = re.sub(r"/אקורדים(?:/גרסה_קלה)?/?$", "", path)
+        path = re.sub(r"/(פרשנות|איך_לנגן)/?$", "", path)
+        return urllib.parse.urlunparse((scheme, netloc, path, "", "", ""))
+
+    return urllib.parse.urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
+def _search_result_title_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    segments = [segment for segment in urllib.parse.unquote(parsed.path).split("/") if segment]
+    if not segments:
+        return url
+
+    if parsed.netloc.lower().endswith("tab4u.com") and len(segments) >= 3:
+        slug = html.unescape(segments[-1]).rsplit(".", 1)[0]
+        slug = re.sub(r"^\d+_", "", slug)
+        return slug.replace("_", " ").strip()
+
+    if parsed.netloc.lower().endswith("nagnu.co.il") and len(segments) >= 3 and segments[-3] == "אמנים":
+        artist = html.unescape(segments[-2]).replace("_", " ").strip()
+        song = html.unescape(segments[-1]).replace("_", " ").strip()
+        return f"{song} / {artist}".strip(" /")
+
+    return html.unescape(segments[-1]).replace("_", " ").strip()
+
+
+def _dedupe_search_results(results: list[SearchResult]) -> list[SearchResult]:
+    unique: list[SearchResult] = []
+    seen: set[str] = set()
+    for result in results:
+        canonical_url = _canonicalize_lyrics_source_url(getattr(result, "url", ""))
+        if not canonical_url or canonical_url in seen:
+            continue
+        seen.add(canonical_url)
+        unique.append(
+            SearchResult(
+                title=getattr(result, "title", "") or _search_result_title_from_url(canonical_url),
+                snippet=getattr(result, "snippet", ""),
+                url=canonical_url,
+            )
+        )
+    return unique
+
+
+def _parse_tab4u_search_results(html_text: str) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    for href, label_html in re.findall(
+        r'<a[^>]+ShowIFD\(this,\s*[\'"]song[\'"][^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        html_text,
+        re.S | re.I,
+    ):
+        absolute_url = urllib.parse.urljoin("https://www.tab4u.com/", href)
+        canonical_url = _canonicalize_lyrics_source_url(absolute_url)
+        label = _strip_html(label_html)
+        results.append(
+            SearchResult(
+                title=label,
+                snippet="Tab4U internal search",
+                url=canonical_url,
+            )
+        )
+    return _dedupe_search_results(results)
+
+
+def _search_tab4u_results(query: str) -> list[SearchResult]:
+    cache_key = f"tab4u:{query}"
+    cached = _DIRECT_SITE_SEARCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    last_results: list[SearchResult] = []
+    for candidate_query in _relax_search_queries(query):
+        encoded_query = urllib.parse.quote_plus(candidate_query)
+        try:
+            html_text = _fetch_text(
+                f"https://www.tab4u.com/resultsSimple?tab=songs&q={encoded_query}",
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.info("Tab4U internal search failed for %s: %s", candidate_query, exc)
+            continue
+
+        parsed_results = _parse_tab4u_search_results(html_text)
+        if parsed_results:
+            _DIRECT_SITE_SEARCH_CACHE[cache_key] = parsed_results
+            return parsed_results
+        last_results = parsed_results
+
+    _DIRECT_SITE_SEARCH_CACHE[cache_key] = last_results
+    return last_results
+
+
+def _context_search_terms(context: dict[str, str]) -> tuple[set[str], set[str]]:
+    song_tokens = {
+        token
+        for token in _top_keywords(context["song"], limit=8)
+        if len(token) >= 3 and token not in STOPWORDS and token not in _WEAK_CONTEXT_TOKENS
+    }
+    artist_tokens = {
+        token
+        for token in (
+            _top_keywords(context["hebrew_artist"], limit=6)
+            + _top_keywords(context["latin_artist"], limit=6)
+        )
+        if len(token) >= 3 and token not in STOPWORDS and token not in _WEAK_CONTEXT_TOKENS
+    }
+    return song_tokens, artist_tokens
+
+
+def _score_candidate_url(url: str, context: dict[str, str]) -> float:
+    song_tokens, artist_tokens = _context_search_terms(context)
+    if not song_tokens and not artist_tokens:
+        return 0.0
+
+    decoded_url = html.unescape(urllib.parse.unquote(url))
+    parsed = urllib.parse.urlparse(decoded_url)
+    path_text = parsed.path.replace("/", " ").replace("_", " ")
+    path_tokens = set(_top_keywords(path_text, limit=24))
+
+    song_overlap = path_tokens & song_tokens
+    artist_overlap = path_tokens & artist_tokens
+
+    if song_tokens and not song_overlap:
+        return 0.0
+    if artist_tokens and not artist_overlap:
+        return 0.0
+    if not song_overlap and not artist_overlap:
+        return 0.0
+
+    score = float(len(song_overlap) * 3 + len(artist_overlap) * 2)
+    if artist_tokens and len(artist_overlap) >= min(2, len(artist_tokens)):
+        score += 1.0
+    lowered_path = parsed.path.lower()
+    if "/lyrics/" in lowered_path or "track/lyrics" in lowered_path:
+        score += 1.6
+    if "/tabs/" in lowered_path:
+        score += 0.6
+    if "type=" in parsed.query:
+        score -= 2.0
+    if any(marker in decoded_url for marker in ("/פרשנות", "/איך_לנגן", "/אקורדים/גרסה_קלה")):
+        score -= 1.5
+    if song_tokens and len(song_overlap) == len(song_tokens):
+        score += 1.2
+    if artist_tokens and artist_overlap:
+        score += 0.4
+    return score
+
+
+def _sanitize_internal_site_query(query: str) -> str:
+    cleaned = re.sub(r"\bsite:[^\s]+\b", " ", query, flags=re.I)
+    cleaned = re.sub(r"\b(?:lyrics|lyric|מילים|לשיר)\b", " ", cleaned, flags=re.I)
+    cleaned = cleaned.replace('"', " ")
+    cleaned = re.sub(r"[&|/+]+", " ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def _load_tab4u_lyrics_urls() -> list[str]:
+    cache_key = "tab4u:sitemap:lyrics"
+    cached = _SITEMAP_URL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    urls: list[str] = []
+    try:
+        index_xml = _fetch_text("https://www.tab4u.com/sitemap.xml", timeout=25)
+        sitemap_urls = [
+            html.unescape(match)
+            for match in re.findall(r"<loc>(.*?)</loc>", index_xml)
+            if "x=songs" in html.unescape(match)
+        ]
+        for sitemap_url in sitemap_urls:
+            try:
+                xml_text = _fetch_text(sitemap_url, timeout=30)
+            except Exception as exc:
+                logger.info("Tab4U sitemap part failed for %s: %s", sitemap_url, exc)
+                continue
+            for raw_url in re.findall(r"<loc>(.*?)</loc>", xml_text):
+                candidate_url = html.unescape(raw_url)
+                if "/lyrics/songs/" not in candidate_url or "type=" in candidate_url:
+                    continue
+                urls.append(_canonicalize_lyrics_source_url(candidate_url))
+    except Exception as exc:
+        logger.info("Tab4U sitemap fetch failed: %s", exc)
+
+    deduped_urls = list(dict.fromkeys(urls))
+    _SITEMAP_URL_CACHE[cache_key] = deduped_urls
+    return deduped_urls
+
+
+def _load_nagnu_lyrics_urls() -> list[str]:
+    cache_key = "nagnu:sitemap:lyrics"
+    cached = _SITEMAP_URL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    urls: list[str] = []
+    try:
+        xml_text = _fetch_text("https://www.nagnu.co.il/sitemap.xml", timeout=35)
+        for raw_url in re.findall(r"<loc>(.*?)</loc>", xml_text):
+            candidate_url = _canonicalize_lyrics_source_url(html.unescape(raw_url))
+            decoded_url = html.unescape(urllib.parse.unquote(candidate_url))
+            if "/אומנים/" not in decoded_url:
+                continue
+            if any(marker in decoded_url for marker in ("/מורים_", "/פרשנות", "/איך_לנגן", "/אקורדים")):
+                continue
+            urls.append(candidate_url)
+    except Exception as exc:
+        logger.info("Nagnu sitemap fetch failed: %s", exc)
+
+    deduped_urls = list(dict.fromkeys(urls))
+    _SITEMAP_URL_CACHE[cache_key] = deduped_urls
+    return deduped_urls
+
+
+def _search_sitemap_results(
+    context: dict[str, str],
+    url_loader,
+    *,
+    source_name: str,
+    max_results: int = 4,
+) -> list[SearchResult]:
+    scored_results: list[tuple[float, SearchResult]] = []
+    for candidate_url in url_loader():
+        score = _score_candidate_url(candidate_url, context)
+        if score < 3.0:
+            continue
+        scored_results.append(
+            (
+                score,
+                SearchResult(
+                    title=_search_result_title_from_url(candidate_url),
+                    snippet=f"{source_name} sitemap",
+                    url=candidate_url,
+                ),
+            )
+        )
+
+    scored_results.sort(key=lambda item: item[0], reverse=True)
+    return _dedupe_search_results([result for _score, result in scored_results[:max_results]])
+
+
+def _search_known_site_results(
+    title: str,
+    queries: list[str],
+    context: dict[str, str],
+) -> list[SearchResult]:
+    del title
+
+    preferred_queries = [
+        f"{context['hebrew_artist']} {context['song']}".strip(),
+        context["song"].strip(),
+        context["clean_title"].strip(),
+        f"{context['latin_artist']} {context['song']}".strip(),
+    ]
+    preferred_queries.extend(
+        _sanitize_internal_site_query(query)
+        for query in queries[:3]
+        if _sanitize_internal_site_query(query)
+    )
+    candidate_queries = [query for query in dict.fromkeys(preferred_queries) if query]
+
+    results: list[SearchResult] = []
+    for query in candidate_queries[:4]:
+        for result in _search_tab4u_results(query):
+            candidate = SearchResult(
+                title=getattr(result, "title", "") or _search_result_title_from_url(result.url),
+                snippet=getattr(result, "snippet", ""),
+                url=result.url,
+            )
+            if _matches_title_context(candidate, context) or _score_candidate_url(result.url, context) >= 5.0:
+                results.append(result)
+
+    results.extend(
+        _search_sitemap_results(
+            context,
+            _load_tab4u_lyrics_urls,
+            source_name="Tab4U",
+            max_results=4,
+        )
+    )
+    results.extend(
+        _search_sitemap_results(
+            context,
+            _load_nagnu_lyrics_urls,
+            source_name="Nagnu",
+            max_results=4,
+        )
+    )
+
+    filtered_results: list[SearchResult] = []
+    for result in _dedupe_search_results(results):
+        candidate = SearchResult(
+            title=getattr(result, "title", "") or _search_result_title_from_url(result.url),
+            snippet=getattr(result, "snippet", ""),
+            url=result.url,
+        )
+        if _matches_title_context(candidate, context) or _score_candidate_url(result.url, context) >= 5.0:
+            filtered_results.append(result)
+
+    deduped = _dedupe_search_results(filtered_results)
+    deduped.sort(
+        key=lambda result: (
+            _domain_priority(result.url),
+            -_score_candidate_url(result.url, context),
+            result.url,
+        )
+    )
+    return deduped[:8]
+
+
+def _repair_draft_from_candidate_lines(
+    draft_lines: list[str],
+    candidate_lines: list[str],
+) -> tuple[list[str], int, float]:
+    normalized_draft = [line.strip() for line in draft_lines if line.strip()]
+    normalized_candidates = [line.strip() for line in candidate_lines if line.strip()]
+    if not normalized_draft or not normalized_candidates:
+        return [], 0, 0.0
+
+    min_window_lines = max(1, min(len(normalized_draft), max(1, len(normalized_draft) // 2)))
+    max_window_lines = max(min_window_lines, len(normalized_draft) + 6)
+    best_lines: list[str] = []
+    best_corrections = 0
+    best_score = 0.0
+
+    def _consider_window(lines_window: list[str]) -> None:
+        nonlocal best_lines, best_corrections, best_score
+        expanded_lines = _expand_repeated_candidate_lines(normalized_draft, lines_window)
+        repaired_lines, correction_count = _repair_draft_lines_from_source_lines(normalized_draft, expanded_lines)
+        paired_scores = [
+            max(_line_similarity(left, right), _line_token_overlap(left, right))
+            for left, right in zip(normalized_draft, repaired_lines)
+        ]
+        average_score = sum(paired_scores) / max(1, len(paired_scores))
+        line_coverage = min(len(lines_window), len(normalized_draft)) / max(
+            len(lines_window),
+            len(normalized_draft),
+            1,
+        )
+        combined_score = average_score * 0.88 + line_coverage * 0.12
+        if correction_count <= 0 and combined_score < 0.72:
+            return
+        if combined_score > best_score:
+            best_lines = repaired_lines
+            best_corrections = correction_count
+            best_score = combined_score
+
+    _consider_window(normalized_candidates)
+
+    if len(normalized_candidates) > len(normalized_draft) + 2:
+        for start in range(len(normalized_candidates)):
+            max_end = min(len(normalized_candidates), start + max_window_lines)
+            for end in range(start + min_window_lines, max_end + 1):
+                _consider_window(normalized_candidates[start:end])
+
+    return best_lines, best_corrections, best_score
+
+
+def _clean_tab4u_lyrics_html(page_html: str) -> str | None:
+    lyrics_block: str | None = None
+
+    match = re.search(r'id=["\']songContentTPL["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+    if match:
+        lyrics_block = match.group(1)
+
+    if not lyrics_block:
+        match = re.search(r'id=["\']songLyricsDiv["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+        if match:
+            lyrics_block = match.group(1)
+
+    if not lyrics_block:
+        song_cells = re.findall(
+            r'<td[^>]+class=["\'][^"\']*\bsong\b[^"\']*["\'][^>]*>(.*?)</td>',
+            page_html,
+            re.S | re.I,
+        )
+        if song_cells:
+            lyrics_block = "<br>".join(song_cells)
+
+    if not lyrics_block:
+        return None
+
+    filtered_lines: list[str] = []
+    cleaned_block = _strip_html_preserving_lines(lyrics_block)
+    for raw_line in cleaned_block.splitlines():
+        line = raw_line.replace("\xa0", " ").strip(" \t-")
+        if not line:
+            continue
+        signature = _line_signature(line)
+        if not signature:
+            continue
+        if re.fullmatch(r"[A-G][#bm0-9*+/()' -]{0,12}:\s*[x0-9]{3,}", line, re.I):
+            continue
+        if re.fullmatch(r"[A-G][#bm0-9*+/()' -]{1,20}", line, re.I):
+            continue
+        if signature in {"פתיחה", "סיום", "מעבר", "אינטרו"}:
+            continue
+        if "אקורדים לשיר" in line or "מילים לשיר" in line:
+            continue
+        filtered_lines.append(line)
+
+    if filtered_lines:
+        return "<br>".join(filtered_lines)
+    return lyrics_block
+
+
+def _extract_site_specific_lyrics(url: str, page_html: str) -> str | None:
+    domain = _domain_from_url(url)
+    if "tab4u" in domain:
+        cleaned_tab4u = _clean_tab4u_lyrics_html(page_html)
+        if cleaned_tab4u:
+            return cleaned_tab4u
+    return _PREVIOUS_EXTRACT_SITE_SPECIFIC_LYRICS(url, page_html)
+
+
+def _multistep_search_all_sources_override(
+    self,
+    title: str,
+    draft_or_text: TranscriptDraft | str,
+) -> dict[str, list[str]]:
+    import concurrent.futures
+
+    draft = _coerce_search_draft(draft_or_text)
+    draft_text = draft.text
+    draft_lines = _draft_lines(draft)
+    queries = _build_query_variants(title, draft_text)
+    context = _extract_title_context(title)
+    sources: dict[str, tuple[float, list[str]]] = {}
+    urls_by_domain: dict[str, list[str]] = {}
+    google_failed = False
+
+    def _remember_result(result) -> None:
+        url = _canonicalize_lyrics_source_url(getattr(result, "url", ""))
+        if not url:
+            return
+
+        domain = _domain_from_url(url)
+        if not any(domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS):
+            return
+
+        result_for_match = SearchResult(
+            title=getattr(result, "title", "") or _search_result_title_from_url(url),
+            snippet=getattr(result, "snippet", ""),
+            url=url,
+        )
+        if not _looks_like_lyrics_result(result_for_match):
+            return
+        if not _matches_title_context(result_for_match, context):
+            result_for_match = SearchResult(
+                title=_search_result_title_from_url(url),
+                snippet=result_for_match.snippet,
+                url=url,
+            )
+            if not _matches_title_context(result_for_match, context):
+                return
+
+        domain_urls = urls_by_domain.setdefault(domain, [])
+        if url not in domain_urls and len(domain_urls) < 3:
+            domain_urls.append(url)
+
+    for query in queries[:5]:
+        try:
+            results = self._google.search(query, num=10)
+            for result in results:
+                _remember_result(result)
+        except Exception as exc:
+            logger.warning("Google search failed for query '%s': %s", query, exc)
+            if "429" in str(exc):
+                google_failed = True
+                break
+
+    if google_failed or len(urls_by_domain) < 2:
+        for query in queries[:5]:
+            try:
+                results = _search_web_results(query)
+                for result in results:
+                    _remember_result(result)
+            except Exception as exc:
+                logger.warning("Web fallback search failed: %s", exc)
+
+    if len(urls_by_domain) < 2:
+        for result in _search_known_site_results(title, queries, context):
+            _remember_result(result)
+
+    def _fetch_and_parse(url: str) -> tuple[str, list[str], float]:
+        source_key = _domain_option_key(url)
+        try:
+            html_body = _fetch_text(url, timeout=15)
+            if _is_bot_blocked(html_body):
+                return source_key, [], 0.0
+
+            specific = _extract_site_specific_lyrics(url, html_body)
+            effective_html = specific if specific else html_body
+            window_score, corrected_lines, _correction_count = _find_best_lyrics_window(effective_html, draft)
+            if corrected_lines and window_score >= 0.18:
+                return source_key, corrected_lines, window_score
+
+            extracted_entries = _extract_candidate_lyrics_line_entries(effective_html, draft_lines)
+            extracted_lines = [line for line, _tokens in extracted_entries]
+            repaired_lines, repaired_corrections, repair_score = _repair_draft_from_candidate_lines(
+                draft_lines,
+                extracted_lines,
+            )
+            if repaired_lines and (repair_score >= 0.5 or (repaired_corrections > 0 and repair_score >= 0.46)):
+                return source_key, repaired_lines, repair_score
+        except Exception as exc:
+            logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
+        return source_key, [], 0.0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(_fetch_and_parse, url): url
+            for domain_urls in urls_by_domain.values()
+            for url in domain_urls
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                key, lines, score = future.result()
+                if lines and (key not in sources or score > sources[key][0]):
+                    sources[key] = (score, lines)
+            except Exception as exc:
+                logger.warning("Source fetch error: %s", exc)
+
+    try:
+        yt_results = self._youtube.search(f"{title} {HEBREW_LYRICS_QUERY}", max_results=3)
+        for yt_result in yt_results:
+            desc = yt_result.snippet
+            if desc and re.search(r"[\u0590-\u05FF]", desc):
+                lines = [
+                    line.strip()
+                    for line in desc.splitlines()
+                    if line.strip() and re.search(r"[\u0590-\u05FF]", line) and len(line.strip()) >= 2
+                ]
+                prepared_lines = _expand_repeated_candidate_lines(draft_lines, lines)
+                if len(prepared_lines) >= max(3, min(3, len(draft_lines))):
+                    sources[f"youtube_{yt_result.title[:20]}"] = (0.25, prepared_lines)
+                    break
+    except Exception as exc:
+        logger.warning("YouTube search failed: %s", exc)
+
+    return {source_name: lines for source_name, (_score, lines) in sources.items()}
+
+
+MultiStepLyricsVerifier._search_all_sources = _multistep_search_all_sources_override
+
+
+def _build_query_variants(title: str, draft_text: str) -> list[str]:
+    context = _extract_title_context(title)
+    clean_title = context["clean_title"]
+    hebrew_artist = context["hebrew_artist"]
+    latin_artist = context["latin_artist"]
+    song = context["song"]
+    keywords = _top_keywords(draft_text, limit=8)
+    keyword_tail = " ".join(keywords[:4])
+    lyric_snippets = _draft_search_snippets(draft_text, limit=3)
+    hebrew_suffix = HEBREW_LYRICS_QUERY
+
+    queries: list[str] = []
+    if hebrew_artist and song:
+        queries.extend(
+            [
+                f"{hebrew_artist} {song} {hebrew_suffix}",
+                f"{song} {hebrew_artist} {hebrew_suffix}",
+                f"\"{hebrew_artist}\" \"{song}\" {hebrew_suffix}",
+            ]
+        )
+    if latin_artist and song:
+        queries.extend(
+            [
+                f"\"{latin_artist}\" \"{song}\" lyrics",
+                f"{latin_artist} {song} lyrics",
+            ]
+        )
+    if clean_title:
+        queries.append(f"{clean_title} {hebrew_suffix}")
+        queries.append(f"{clean_title} lyrics")
+    if song:
+        queries.append(f"\"{song}\" {hebrew_suffix}")
+        queries.append(f"\"{song}\" lyrics")
+    for snippet in lyric_snippets[:2]:
+        if song:
+            queries.append(f"\"{song}\" \"{snippet}\" {hebrew_suffix}")
+        queries.append(f"\"{snippet}\" {hebrew_suffix}")
+    for domain in SITE_QUERY_DOMAINS:
+        suffix = "lyrics" if domain in {"genius.com", "lyricstranslate.com"} else hebrew_suffix
+        if hebrew_artist and song:
+            queries.append(f"site:{domain} \"{hebrew_artist}\" \"{song}\" {suffix}")
+        if latin_artist and song:
+            queries.append(f"site:{domain} \"{latin_artist}\" \"{song}\" {suffix}")
+        for snippet in lyric_snippets[:1]:
+            queries.append(f"site:{domain} \"{snippet}\" {suffix}")
+    if clean_title and keyword_tail:
+        queries.append(f"{clean_title} {keyword_tail}")
+    elif keyword_tail:
+        queries.append(f"{keyword_tail} {hebrew_suffix}")
+
+    if keyword_tail:
+        queries.append(f"{HEBREW_LYRICS_FOR_SONG_QUERY} {keyword_tail}")
+
+    return list(dict.fromkeys(query for query in queries if query.strip()))
+
+
+def _find_best_source_line_window(
+    candidate_text: str,
+    draft: TranscriptDraft,
+) -> tuple[list[str], float]:
+    draft_tokens = [_normalize_token(token) for token in _tokenize_words(draft.text)]
+    if not draft_tokens:
+        return [], 0.0
+
+    draft_lines = _draft_lines(draft)
+    extracted_entries = _extract_candidate_lyrics_line_entries(candidate_text)
+    if not extracted_entries:
+        extracted_entries = _extract_candidate_lyrics_line_entries(candidate_text, draft_lines)
+    if not extracted_entries:
+        return [], 0.0
+
+    draft_token_set = set(draft_tokens)
+    target_line_count = max(1, len(draft_lines))
+    target_word_count = max(1, len(draft_tokens))
+    min_window_lines = 1 if target_line_count <= 2 else max(2, target_line_count // 2)
+    max_window_lines = max(min_window_lines, target_line_count + 6)
+
+    best_lines: list[str] = []
+    best_score = 0.0
+
+    def _score_window(candidate_entries: list[tuple[str, list[str]]]) -> float:
+        normalized_tokens = [
+            _normalize_token(token)
+            for _line, tokens in candidate_entries
+            for token in tokens
+        ]
+        if not normalized_tokens:
+            return 0.0
+
+        ratio = SequenceMatcher(None, draft_tokens, normalized_tokens, autojunk=False).ratio()
+        overlap = len(draft_token_set & set(normalized_tokens)) / max(
+            1,
+            min(len(draft_token_set), len(set(normalized_tokens))),
+        )
+        line_coverage = min(len(candidate_entries), target_line_count) / max(
+            len(candidate_entries),
+            target_line_count,
+            1,
+        )
+        word_coverage = min(len(normalized_tokens), target_word_count) / max(
+            len(normalized_tokens),
+            target_word_count,
+            1,
+        )
+        return ratio * 0.52 + overlap * 0.23 + line_coverage * 0.15 + word_coverage * 0.10
+
+    def _consider(candidate_entries: list[tuple[str, list[str]]]) -> None:
+        nonlocal best_lines, best_score
+        if not candidate_entries:
+            return
+        candidate_lines = [line for line, _tokens in candidate_entries]
+        score = _score_window(candidate_entries)
+        if score > best_score or (
+            abs(score - best_score) <= 0.03 and len(candidate_lines) > len(best_lines)
+        ):
+            best_lines = candidate_lines
+            best_score = score
+
+    _consider(extracted_entries)
+
+    if len(extracted_entries) > max_window_lines:
+        for start in range(len(extracted_entries)):
+            collected: list[tuple[str, list[str]]] = []
+            max_end = min(len(extracted_entries), start + max_window_lines)
+            for end in range(start, max_end):
+                collected.append(extracted_entries[end])
+                if len(collected) < min_window_lines:
+                    continue
+
+                token_count = sum(len(tokens) for _line, tokens in collected)
+                if token_count < max(4, int(target_word_count * 0.35)):
+                    continue
+                if token_count > int(target_word_count * 1.9) + 12:
+                    break
+
+                _consider(collected)
+
+    full_lines = [line for line, _tokens in extracted_entries]
+    full_score = _score_window(extracted_entries)
+    full_extends_best = (
+        len(full_lines) > len(best_lines) > 0
+        and all(
+            max(_line_similarity(full_lines[index], best_line), _line_token_overlap(full_lines[index], best_line)) >= 0.88
+            for index, best_line in enumerate(best_lines)
+        )
+    )
+    if (
+        full_lines
+        and len(full_lines) > len(best_lines)
+        and (
+            full_score >= max(0.34, best_score - 0.06)
+            or (full_extends_best and full_score >= max(0.26, best_score - 0.18))
+        )
+    ):
+        return full_lines, full_score
+
+    return best_lines, best_score
+
+
+def _line_block_quality(lines: list[str]) -> tuple[int, int, int]:
+    normalized_lines = [str(line).strip() for line in lines if str(line).strip()]
+    line_count = len(normalized_lines)
+    substantial_count = sum(1 for line in normalized_lines if _is_substantial_lyrics_line(line))
+    total_words = sum(len(_line_signature(line).split()) for line in normalized_lines)
+    return line_count, substantial_count, total_words
+
+
+def _lines_are_near_duplicates(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    similarity = _line_similarity(left, right)
+    overlap = _line_token_overlap(left, right)
+    return max(similarity, overlap) >= 0.92
+
+
+def _append_unique_lyrics_line(lines: list[str], line: str) -> None:
+    normalized_line = str(line).strip()
+    if not normalized_line:
+        return
+    if lines and _lines_are_near_duplicates(lines[-1], normalized_line):
+        return
+    lines.append(normalized_line)
+
+
+def _line_blocks_are_related(base_block: list[str], candidate_block: list[str]) -> bool:
+    if not base_block or not candidate_block:
+        return False
+    similarities = [
+        max(_line_similarity(left, right), _line_token_overlap(left, right))
+        for left in base_block
+        for right in candidate_block
+    ]
+    return max(similarities, default=0.0) >= 0.46
+
+
+def _choose_richer_line_block(base_block: list[str], candidate_block: list[str]) -> list[str]:
+    if _line_block_quality(candidate_block) > _line_block_quality(base_block):
+        return candidate_block
+    return base_block
+
+
+def _merge_source_line_sequences(base_lines: list[str], candidate_lines: list[str]) -> list[str]:
+    normalized_base = [str(line).strip() for line in base_lines if str(line).strip()]
+    normalized_candidate = [str(line).strip() for line in candidate_lines if str(line).strip()]
+    if not normalized_base:
+        return normalized_candidate
+    if not normalized_candidate:
+        return normalized_base
+
+    base_signatures = [_line_signature(line) for line in normalized_base]
+    candidate_signatures = [_line_signature(line) for line in normalized_candidate]
+    merged: list[str] = []
+
+    matcher = SequenceMatcher(None, base_signatures, candidate_signatures, autojunk=False)
+    for tag, b0, b1, c0, c1 in matcher.get_opcodes():
+        if tag == "equal":
+            for line in normalized_base[b0:b1]:
+                _append_unique_lyrics_line(merged, line)
+            continue
+
+        if tag == "insert":
+            previous_line = merged[-1] if merged else ""
+            next_line = normalized_base[b0] if b0 < len(normalized_base) else ""
+            for line in normalized_candidate[c0:c1]:
+                if _lines_are_near_duplicates(line, previous_line) or _lines_are_near_duplicates(line, next_line):
+                    continue
+                _append_unique_lyrics_line(merged, line)
+            continue
+
+        if tag == "delete":
+            for line in normalized_base[b0:b1]:
+                _append_unique_lyrics_line(merged, line)
+            continue
+
+        if tag == "replace":
+            base_block = normalized_base[b0:b1]
+            candidate_block = normalized_candidate[c0:c1]
+            chosen_block = base_block
+            if _line_blocks_are_related(base_block, candidate_block):
+                chosen_block = _choose_richer_line_block(base_block, candidate_block)
+            elif _line_block_quality(candidate_block) > _line_block_quality(base_block) and len(base_block) <= 1:
+                chosen_block = candidate_block
+            for line in chosen_block:
+                _append_unique_lyrics_line(merged, line)
+
+    return merged or normalized_base
+
+
+def _merge_search_source_versions(
+    sources: dict[str, list[str]],
+) -> tuple[list[str], list[str]]:
+    normalized_sources = [
+        (source_name, [str(line).strip() for line in lines if str(line).strip()])
+        for source_name, lines in sources.items()
+        if lines
+    ]
+    if not normalized_sources:
+        return [], []
+
+    normalized_sources.sort(
+        key=lambda item: (_line_block_quality(item[1]), item[0]),
+        reverse=True,
+    )
+
+    merged_lines = list(normalized_sources[0][1])
+    supporting_sources = [normalized_sources[0][0]]
+
+    for source_name, lines in normalized_sources[1:]:
+        merged_lines = _merge_source_line_sequences(merged_lines, lines)
+        supporting_sources.append(source_name)
+
+    return merged_lines, list(dict.fromkeys(supporting_sources))
+
+
+def _build_search_merged_option(
+    merged_lines: list[str],
+    supporting_sources: list[str],
+    *,
+    confidence: float,
+    reference_lines: list[str] | None = None,
+) -> dict[str, object] | None:
+    normalized_merged = [str(line).strip() for line in merged_lines if str(line).strip()]
+    if not normalized_merged:
+        return None
+    if reference_lines is not None and not _line_sets_differ(reference_lines, normalized_merged):
+        return None
+    unique_sources = list(dict.fromkeys(supporting_sources))
+    option: dict[str, object] = {
+        "option_id": "search_merged",
+        "label": "תוצאת חיפוש משולבת",
+        "lines": normalized_merged,
+        "source_url": "",
+        "confidence": round(confidence, 3),
+        "source_count": len(unique_sources),
+    }
+    if unique_sources:
+        option["supporting_sources"] = unique_sources
+    return option
+
+
+def _evaluate_candidate_text_against_draft(
+    draft: TranscriptDraft,
+    candidate_text: str,
+) -> tuple[list[str], float]:
+    candidate_lines, candidate_score = _find_best_source_line_window(candidate_text, draft)
+    if candidate_lines and candidate_score >= 0.32:
+        return candidate_lines, candidate_score
+    return [], 0.0
+
+
+def _extract_youtube_source_lines(
+    source_url: str,
+    title: str,
+    draft: TranscriptDraft,
+) -> tuple[list[str], float]:
+    if not source_url:
+        return [], 0.0
+
+    source_domain = _domain_from_url(source_url)
+    if not any(
+        source_domain.endswith(candidate)
+        for candidate in ("youtube.com", "youtu.be", "music.youtube.com")
+    ):
+        return [], 0.0
+
+    try:
+        import yt_dlp
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "skip_download": True,
+            "nocheckcertificate": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(source_url, download=False)
+    except Exception as exc:
+        logger.info("Direct YouTube lyrics fetch failed for %s: %s", source_url, exc)
+        return [], 0.0
+
+    if not isinstance(info, dict):
+        return [], 0.0
+
+    description = str(info.get("description") or "").strip()
+    if not description or not re.search(r"[\u0590-\u05FF]", description):
+        return [], 0.0
+    cleaned_description = _clean_youtube_description_text(description)
+    if cleaned_description:
+        description = cleaned_description
+
+    context = _extract_title_context(title)
+    candidate = SearchResult(
+        title=str(info.get("title") or title).strip(),
+        snippet=description[:200],
+        url=source_url,
+    )
+    if not _matches_title_context(candidate, context):
+        return [], 0.0
+
+    candidate_lines, candidate_score = _evaluate_candidate_text_against_draft(draft, description)
+    if not candidate_lines:
+        return [], 0.0
+
+    cleaned_lines = _trim_youtube_credit_edges(candidate_lines)
+    if not cleaned_lines:
+        return [], 0.0
+
+    return cleaned_lines, candidate_score
+
+
+def _multistep_search_all_sources_override(
+    self,
+    title: str,
+    draft_or_text: TranscriptDraft | str,
+) -> dict[str, list[str]]:
+    import concurrent.futures
+
+    draft = _coerce_search_draft(draft_or_text)
+    queries = _build_query_variants(title, draft.text)
+    context = _extract_title_context(title)
+    source_url = getattr(self, "_current_source_url", "")
+    sources: dict[str, tuple[float, list[str]]] = {}
+    urls_by_domain: dict[str, list[str]] = {}
+    google_failed = False
+
+    def _remember_result(result) -> None:
+        url = _canonicalize_lyrics_source_url(getattr(result, "url", ""))
+        if not url:
+            return
+
+        domain = _domain_from_url(url)
+        if not any(domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS):
+            return
+
+        candidate = SearchResult(
+            title=getattr(result, "title", "") or _search_result_title_from_url(url),
+            snippet=getattr(result, "snippet", ""),
+            url=url,
+        )
+        if not _looks_like_lyrics_result(candidate) or not _matches_title_context(candidate, context):
+            return
+
+        domain_urls = urls_by_domain.setdefault(domain, [])
+        if url not in domain_urls and len(domain_urls) < 3:
+            domain_urls.append(url)
+
+    source_domain = _domain_from_url(_canonicalize_lyrics_source_url(source_url))
+    if source_url and any(source_domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS):
+        urls_by_domain.setdefault(source_domain, []).append(_canonicalize_lyrics_source_url(source_url))
+
+    youtube_lines, youtube_score = _extract_youtube_source_lines(source_url, title, draft)
+    if youtube_lines:
+        sources["youtube"] = (youtube_score, youtube_lines)
+        if youtube_score >= 0.65:
+            return {"youtube": youtube_lines}
+
+    for query in queries[:5]:
+        try:
+            results = self._google.search(query, num=10)
+            for result in results:
+                _remember_result(result)
+        except Exception as exc:
+            logger.warning("Google search failed for query '%s': %s", query, exc)
+            if "429" in str(exc):
+                google_failed = True
+                break
+
+    if google_failed or len(urls_by_domain) < 2:
+        for query in queries[:5]:
+            try:
+                results = _search_web_results(query)
+                for result in results:
+                    _remember_result(result)
+            except Exception as exc:
+                logger.warning("Web fallback search failed: %s", exc)
+
+    if len(urls_by_domain) < 2:
+        for result in _search_known_site_results(title, queries, context):
+            _remember_result(result)
+
+    def _fetch_and_parse(url: str) -> tuple[str, list[str], float]:
+        source_key = _domain_option_key(url)
+        try:
+            html_body = _fetch_text(url, timeout=15)
+            if _is_bot_blocked(html_body):
+                return source_key, [], 0.0
+
+            specific = _extract_site_specific_lyrics(url, html_body)
+            effective_html = specific if specific else html_body
+            candidate_lines, candidate_score = _evaluate_candidate_text_against_draft(draft, effective_html)
+            if candidate_lines:
+                return source_key, candidate_lines, candidate_score
+        except Exception as exc:
+            logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
+        return source_key, [], 0.0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(_fetch_and_parse, url): url
+            for domain_urls in urls_by_domain.values()
+            for url in domain_urls
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                key, lines, score = future.result()
+                if lines and (key not in sources or score > sources[key][0]):
+                    sources[key] = (score, lines)
+            except Exception as exc:
+                logger.warning("Source fetch error: %s", exc)
+
+    try:
+        yt_results = self._youtube.search(f"{title} {HEBREW_LYRICS_QUERY}", max_results=3)
+        for yt_result in yt_results:
+            desc = _clean_youtube_description_text(yt_result.snippet)
+            if desc and re.search(r"[\u0590-\u05FF]", desc):
+                candidate_lines, candidate_score = _evaluate_candidate_text_against_draft(draft, desc)
+                cleaned_lines = _trim_youtube_credit_edges(candidate_lines)
+                if cleaned_lines and candidate_score > sources.get("youtube", (0.0, []))[0]:
+                    sources["youtube"] = (candidate_score, cleaned_lines)
+                    break
+    except Exception as exc:
+        logger.warning("YouTube search failed: %s", exc)
+
+    return {source_name: lines for source_name, (_score, lines) in sources.items()}
+
+
+SOURCE_DISPLAY_NAMES.setdefault("youtube", "YouTube")
+MultiStepLyricsVerifier._search_all_sources = _multistep_search_all_sources_override

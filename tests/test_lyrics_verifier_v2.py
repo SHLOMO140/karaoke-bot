@@ -60,6 +60,57 @@ def test_zero_sources_uses_whisper_with_gemini(mock_gemini_kb, mock_search):
     mock_gemini_kb.assert_called_once()
     assert result.verdict == VerificationVerdict.NO_SOURCES.value
 
+
+@patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._search_all_sources")
+@patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._gemini_knowledge_verify")
+def test_zero_sources_exposes_review_options_without_auto_apply(mock_gemini_kb, mock_search):
+    mock_search.return_value = {}
+    mock_gemini_kb.return_value = (["שלום עולם", "הלב שלך"], 0.55)
+
+    verifier = MultiStepLyricsVerifier()
+    result = verifier.verify("שיר לדוגמה", _draft())
+
+    option_ids = {option["option_id"] for option in result.options}
+    assert {"draft", "verified"} <= option_ids
+    assert any(str(option_id).startswith("source_") for option_id in option_ids)
+    assert result.selected_option_id == "draft"
+    assert result.applied is False
+    assert result.corrected_lines == ["שלום עולם", "הלב שלך"]
+
+
+@patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._search_all_sources")
+@patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._gemini_knowledge_verify")
+def test_zero_sources_high_confidence_can_auto_apply_verified_words(mock_gemini_kb, mock_search):
+    mock_search.return_value = {}
+    mock_gemini_kb.return_value = (["שלום עולם", "הלב שלך"], 0.92)
+
+    verifier = MultiStepLyricsVerifier()
+    result = verifier.verify("שיר לדוגמה", _draft())
+
+    assert result.selected_option_id == "verified"
+    assert result.applied is True
+    assert result.correction_count > 0
+
+
+@patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._search_all_sources")
+def test_zero_sources_reports_actual_fallback_provider(mock_search):
+    mock_search.return_value = {}
+    verifier = MultiStepLyricsVerifier()
+    verifier._llm_provider = "grok"
+    verifier._llm_display_name = "Grok"
+
+    def fake_knowledge_verify(_draft_text, _title):
+        verifier._last_llm_provider_used = "gemini"
+        verifier._last_llm_warning = "Grok לא זמין כרגע, בוצע fallback ל-Gemini."
+        return ["׳©׳׳•׳ ׳¢׳•׳׳", "׳”׳׳‘ ׳©׳׳™"], 0.8
+
+    verifier._gemini_knowledge_verify = fake_knowledge_verify
+    result = verifier.verify("׳©׳™׳¨ ׳׳“׳•׳’׳׳”", _draft())
+
+    assert result.llm_provider == "gemini"
+    assert any("fallback" in warning.lower() for warning in (result.local_warnings or []))
+
+
 @patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._search_all_sources")
 @patch("karaoke.lyrics_verifier.MultiStepLyricsVerifier._gemini_deep_verify")
 def test_gemini_failure_returns_best_available(mock_gemini, mock_search):

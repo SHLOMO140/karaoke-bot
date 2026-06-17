@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from .config import FFMPEG_EXE, PYTHON_EXE
+from .config import FFMPEG_EXE, HIGH_QUALITY_MP3_BITRATE, PYTHON_EXE
 from .exceptions import SeparationError
 
 logger = logging.getLogger(__name__)
@@ -26,9 +26,13 @@ def _find_demucs_file(demucs_out: Path, stem_name: str) -> str:
 
 def _copy_or_convert(src: str, dst: str):
     if src.endswith(".wav") and dst.endswith(".mp3"):
-        result = subprocess.run([FFMPEG_EXE, "-y", "-i", src, "-q:a", "0", dst], capture_output=True, timeout=120)
+        result = subprocess.run(
+            [FFMPEG_EXE, "-y", "-i", src, "-c:a", "libmp3lame", "-b:a", HIGH_QUALITY_MP3_BITRATE, dst],
+            capture_output=True,
+            timeout=120,
+        )
         if result.returncode != 0:
-            raise SeparationError(result.stderr.decode(errors="ignore")[-300:], "המרת הפלייבק ל-MP3 נכשלה.")
+            raise SeparationError(result.stderr.decode(errors="ignore")[-300:], "Failed to convert the instrumental track to MP3.")
         return
     if src.endswith(".mp3") and dst.endswith(".wav"):
         result = subprocess.run(
@@ -37,7 +41,7 @@ def _copy_or_convert(src: str, dst: str):
             timeout=120,
         )
         if result.returncode != 0:
-            raise SeparationError(result.stderr.decode(errors="ignore")[-300:], "המרת הווקאל ל-WAV נכשלה.")
+            raise SeparationError(result.stderr.decode(errors="ignore")[-300:], "Failed to convert the vocals track to WAV.")
         return
     shutil.copy2(src, dst)
 
@@ -56,7 +60,6 @@ class DemucsSeparator:
                 "-m",
                 "demucs",
                 "--two-stems=vocals",
-                "--mp3",
                 "-o",
                 str(demucs_out),
                 abs_input,

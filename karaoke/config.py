@@ -29,6 +29,30 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 YTDLP_STAGING_DIR = RUNTIME_DIR / "yt_dlp"
 YTDLP_STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
+# yt-dlp YouTube bot-detection bypass.
+# Uses node.js + EJS challenge solver by default.
+# Optionally set YTDLP_COOKIE_FILE or place cookies.txt next to bot.py.
+YTDLP_COOKIE_FILE: str = os.getenv("YTDLP_COOKIE_FILE", "")
+YTDLP_COOKIES_FROM_BROWSER: str = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "")
+
+_DEFAULT_COOKIE_FILE = BASE_DIR / "cookies.txt"
+
+
+def ytdlp_base_opts() -> dict:
+    """Return yt-dlp options for bypassing YouTube bot detection."""
+    opts: dict = {
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
+    }
+    # Add cookie auth if available (provides better access than JS solver alone).
+    if YTDLP_COOKIE_FILE:
+        opts["cookiefile"] = YTDLP_COOKIE_FILE
+    elif _DEFAULT_COOKIE_FILE.exists():
+        opts["cookiefile"] = str(_DEFAULT_COOKIE_FILE)
+    elif YTDLP_COOKIES_FROM_BROWSER:
+        opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER,)
+    return opts
+
 for env_name, default_path in {
     "TMP": TMP_DIR,
     "TEMP": TMP_DIR,
@@ -138,6 +162,17 @@ def _load_google_api_key() -> str:
     return ""
 
 
+def _load_xai_api_key() -> str:
+    value = os.getenv("XAI_API_KEY", "").strip()
+    if value:
+        return value
+    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.local"):
+        value = _load_env_value(candidate, {"XAI_API_KEY"})
+        if value:
+            return value
+    return ""
+
+
 def _load_google_search_engine_id() -> str:
     value = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "").strip()
     if value:
@@ -149,8 +184,40 @@ def _load_google_search_engine_id() -> str:
     return ""
 
 
+def _load_config_value(key_name: str, default: str = "") -> str:
+    value = os.getenv(key_name, "").strip()
+    if value:
+        return value
+    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.local"):
+        value = _load_env_value(candidate, {key_name})
+        if value:
+            return value
+    return default
+
+
+def _load_bool_config(key_name: str, default: bool = False) -> bool:
+    value = _load_config_value(key_name, "1" if default else "0").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _load_int_config(key_name: str, default: int = 0) -> int:
+    value = _load_config_value(key_name, str(default)).strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 GEMINI_API_KEY = _load_gemini_api_key()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = _load_config_value("GEMINI_MODEL", "gemini-2.5-flash")
+XAI_API_KEY = _load_xai_api_key()
+XAI_MODEL = _load_config_value("XAI_MODEL", "grok-4")
+LYRICS_LLM_PROVIDER = _load_config_value(
+    "KARAOKE_LYRICS_LLM_PROVIDER",
+    _load_config_value("LYRICS_LLM_PROVIDER", "gemini"),
+)
 
 # Google Custom Search API
 GOOGLE_API_KEY: str = _load_google_api_key()
@@ -192,6 +259,19 @@ ALIGNMENT_BOUNDARY_SEARCH_MS = int(os.getenv("KARAOKE_ALIGNMENT_BOUNDARY_SEARCH_
 DEFAULT_VIDEO_FRAME_RATE = float(os.getenv("KARAOKE_DEFAULT_VIDEO_FRAME_RATE", "25"))
 
 DEFAULT_STYLE_PRESET = os.getenv("KARAOKE_STYLE_PRESET", "blue_outline")
+DEFAULT_DELIVERY_CHAT_ID = _load_int_config("KARAOKE_DEFAULT_DELIVERY_CHAT_ID", 0)
+DEFAULT_DELIVERY_REPLY_TO_MESSAGE_ID = _load_int_config("KARAOKE_DEFAULT_DELIVERY_REPLY_TO_MESSAGE_ID", 0)
+AUTO_DELETE_JOB_AFTER_DELIVERY = _load_bool_config("KARAOKE_AUTO_DELETE_JOB_AFTER_DELIVERY", True)
+COMPLETED_JOB_RETENTION_HOURS = max(1, int(_load_config_value("KARAOKE_COMPLETED_JOB_RETENTION_HOURS", "24")))
+STALE_JOB_RETENTION_HOURS = max(1, int(_load_config_value("KARAOKE_STALE_JOB_RETENTION_HOURS", "72")))
+CODEX_AUTO_REPAIR_ENABLED = _load_bool_config("KARAOKE_ENABLE_CODEX_AUTO_REPAIR", False)
+CODEX_AUTO_REPAIR_COMMAND = _load_config_value(
+    "KARAOKE_CODEX_AUTO_REPAIR_COMMAND",
+    "codex.cmd" if os.name == "nt" else "codex",
+)
+CODEX_AUTO_REPAIR_SANDBOX = _load_config_value("KARAOKE_CODEX_AUTO_REPAIR_SANDBOX", "workspace-write")
+CODEX_AUTO_REPAIR_TIMEOUT_SECONDS = max(30, _load_int_config("KARAOKE_CODEX_AUTO_REPAIR_TIMEOUT_SECONDS", 900))
 
 MAX_TELEGRAM_FILE_SIZE = 45 * 1024 * 1024
+HIGH_QUALITY_MP3_BITRATE = os.getenv("KARAOKE_HIGH_QUALITY_MP3_BITRATE", "320k")
 REVIEW_PAGE_SIZE = int(os.getenv("KARAOKE_REVIEW_PAGE_SIZE", "18"))

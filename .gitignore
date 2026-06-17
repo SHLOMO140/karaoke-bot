@@ -8,5 +8,6 @@ downloads/
 *.log
 .debug_bot_*.txt
 bot_token.txt
+cookies.txt
 firebase-debug*.log
 .claude/

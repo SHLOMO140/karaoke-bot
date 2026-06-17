@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import shutil
 import urllib.request
@@ -11,7 +12,7 @@ from typing import Callable
 import yt_dlp
 
 from . import job_manager
-from .aligner import get_alignment_provider, validate_timing_quality
+from .aligner import analyze_alignment_quality, get_alignment_provider, validate_timing_quality
 from .audio_extractor import (
     convert_to_wav,
     extract_audio_from_video,
@@ -19,9 +20,15 @@ from .audio_extractor import (
     get_video_frame_rate,
     transcode_to_mp3,
 )
-from .config import DEFAULT_VIDEO_FRAME_RATE, FFMPEG_PATH, YTDLP_STAGING_DIR
-from .exceptions import AudioExtractionError, DownloadError
-from .harmony import LibrosaHarmonyAnalyzer, render_chord_sheet_text
+from .chord_sources import lookup_external_chord_sheet, lookup_external_chord_sheet_by_title
+from .config import DEFAULT_VIDEO_FRAME_RATE, FFMPEG_PATH, YTDLP_STAGING_DIR, ytdlp_base_opts
+from .exceptions import AlignmentError, AudioExtractionError, DownloadError, PipelineError
+from .harmony import (
+    LibrosaHarmonyAnalyzer,
+    prepare_song_analysis_for_display,
+    render_chord_sheet_text,
+    summarize_song_analysis_quality,
+)
 from .job_manager import add_warning
 from .language_detector import WhisperLanguageDetector
 from .lyrics_verifier import HybridLyricsVerifier, MultiStepLyricsVerifier
@@ -30,11 +37,13 @@ from .models import (
     JobStatus,
     LanguageDetectionResult,
     LyricsVerificationResult,
+    SingerAnalysisResult,
     SongAnalysis,
     TranscriptDraft,
     TranscriptSegment,
     VideoRequest,
 )
+from .singer_analysis import StructureDuetAnalyzer
 from .styles import get_style
 from .subtitle_guardian import AssSubtitleGuardian
 from .subtitle_generator import AssKaraokeRenderer, SrtRenderer
@@ -57,6 +66,7 @@ class KaraokePipeline:
         lyrics_verifier=None,
         aligner=None,
         song_analyzer=None,
+        singer_analyzer=None,
         srt_renderer=None,
         ass_renderer=None,
         subtitle_validator=None,
@@ -69,6 +79,7 @@ class KaraokePipeline:
         self.lyrics_verifier = lyrics_verifier or MultiStepLyricsVerifier()
         self.aligner = aligner or get_alignment_provider()
         self.song_analyzer = song_analyzer or LibrosaHarmonyAnalyzer()
+        self.singer_analyzer = singer_analyzer or StructureDuetAnalyzer()
         self.srt_renderer = srt_renderer or SrtRenderer()
         self.ass_renderer = ass_renderer or AssKaraokeRenderer()
         self.subtitle_validator = subtitle_validator or AssSubtitleGuardian()
@@ -79,6 +90,7 @@ class KaraokePipeline:
         job_manager.record_provider(self.job, "lyrics_verifier", self.lyrics_verifier.name)
         job_manager.record_provider(self.job, "aligner", self.aligner.name)
         job_manager.record_provider(self.job, "song_analyzer", self.song_analyzer.name)
+        job_manager.record_provider(self.job, "singer_analyzer", self.singer_analyzer.name)
         job_manager.record_provider(self.job, "srt_renderer", self.srt_renderer.name)
         job_manager.record_provider(self.job, "ass_renderer", self.ass_renderer.name)
         job_manager.record_provider(self.job, "subtitle_validator", self.subtitle_validator.name)
@@ -122,10 +134,26 @@ class KaraokePipeline:
             return draft
         self._update_status(JobStatus.TRANSCRIBING)
         vocals_wav = self._ensure_vocals_wav(vocals_path)
-        draft = self.transcriber.transcribe(vocals_wav)
+        transcribe_kwargs = self._build_transcription_kwargs(language_info)
+        draft = self.transcriber.transcribe(vocals_wav, **transcribe_kwargs)
         draft.language_info = language_info
         job_manager.save_draft_transcript(self.job, draft)
         return draft
+
+    def _build_transcription_kwargs(self, language_info: LanguageDetectionResult | None) -> dict[str, object]:
+        try:
+            parameters = inspect.signature(self.transcriber.transcribe).parameters
+        except (TypeError, ValueError, AttributeError):
+            return {}
+
+        if "language" not in parameters:
+            return {}
+
+        # Let Whisper auto-detect on Hebrew-first mixed tracks so English phrases
+        # are not forced through a Hebrew-only language hint.
+        if language_info and language_info.policy_decision == "warn":
+            return {"language": None}
+        return {}
 
     def step_verify_lyrics(self, draft: TranscriptDraft):
         if self.job.manifest.lyrics_verification:
@@ -135,7 +163,12 @@ class KaraokePipeline:
                 job_manager.save_review_transcript(self.job, corrected_segments)
             return verification
         self._update_status(JobStatus.VERIFYING_LYRICS)
-        verification = self.lyrics_verifier.verify(self.job.title, draft)
+        previous_source_url = getattr(self.lyrics_verifier, "_current_source_url", "")
+        setattr(self.lyrics_verifier, "_current_source_url", self.job.source_url)
+        try:
+            verification = self.lyrics_verifier.verify(self.job.title, draft)
+        finally:
+            setattr(self.lyrics_verifier, "_current_source_url", previous_source_url)
         job_manager.save_lyrics_verification(self.job, verification)
         if verification.applied and verification.corrected_lines:
             corrected_segments = job_manager.update_transcript_text(draft.segments, "\n".join(verification.corrected_lines))
@@ -146,15 +179,83 @@ class KaraokePipeline:
         return verification
 
     def step_analyze_music(self, segments: list[TranscriptSegment]) -> SongAnalysis:
-        if self.job.song_analysis_path.exists():
-            analysis = job_manager.load_song_analysis(self.job)
-            if not self.job.lyrics_with_chords_path.exists():
-                job_manager.save_chord_sheet(self.job, render_chord_sheet_text(self.job.display_name, segments, analysis))
-            return analysis
-
         source_audio = self.job.instrumental_path if self.job.instrumental_path.exists() else self.job.original_audio_path
+        delivery_target_key = ""
+        if self.job.song_analysis_path.exists():
+            cached_analysis = job_manager.load_song_analysis(self.job)
+            if cached_analysis.provider == self.song_analyzer.name or not source_audio.exists():
+                cached_quality = summarize_song_analysis_quality(cached_analysis)
+                uses_transposed_delivery_key = bool((cached_analysis.target_key or "").strip())
+                if source_audio.exists() and not cached_quality.reliable_for_delivery:
+                    logger.info(
+                        "Re-running music analysis for %s because cached chord analysis is unreliable.",
+                        self.job.job_id,
+                    )
+                elif uses_transposed_delivery_key:
+                    logger.info(
+                        "Re-running music analysis for %s because cached chord delivery is transposed to %s.",
+                        self.job.job_id,
+                        cached_analysis.target_key,
+                    )
+                else:
+                    if cached_analysis.chord_sheet_text.strip():
+                        job_manager.save_song_analysis(self.job, cached_analysis)
+                        job_manager.save_chord_sheet(self.job, cached_analysis.chord_sheet_text)
+                        return cached_analysis
+
+                    analysis = prepare_song_analysis_for_display(cached_analysis, segments, target_key=delivery_target_key)
+                    job_manager.save_song_analysis(self.job, analysis)
+                    job_manager.save_chord_sheet(self.job, render_chord_sheet_text(self.job.display_name, segments, analysis))
+                    return analysis
+            if cached_analysis.provider != self.song_analyzer.name:
+                logger.info(
+                    "Re-running music analysis for %s because cached provider %s is outdated.",
+                    self.job.job_id,
+                    cached_analysis.provider,
+                )
+
+        try:
+            external_analysis = lookup_external_chord_sheet(
+                self.job.display_name,
+                segments,
+                provider=self.song_analyzer.name,
+                source_audio=str(source_audio) if source_audio.exists() else "",
+                target_key=delivery_target_key,
+            )
+        except Exception as exc:
+            logger.info("External chord lookup failed for %s: %s", self.job.job_id, exc)
+            external_analysis = None
+        if external_analysis is not None and external_analysis.chord_sheet_text.strip():
+            job_manager.save_song_analysis(self.job, external_analysis)
+            job_manager.save_chord_sheet(self.job, external_analysis.chord_sheet_text)
+            return external_analysis
+
+        lookup_title = (self.job.display_name or "").strip()
+        should_try_title_only_lookup = bool(lookup_title) and (
+            " - " in lookup_title or "|" in lookup_title or len(lookup_title.split()) >= 2
+        )
+        title_only_analysis = None
+        if should_try_title_only_lookup:
+            try:
+                title_only_analysis = lookup_external_chord_sheet_by_title(
+                    lookup_title,
+                    provider=self.song_analyzer.name,
+                    source_audio=str(source_audio) if source_audio.exists() else "",
+                    target_key=delivery_target_key,
+                )
+            except Exception as exc:
+                logger.info("Title-only external chord lookup failed for %s: %s", self.job.job_id, exc)
+        if title_only_analysis is not None and title_only_analysis.chord_sheet_text.strip():
+            job_manager.save_song_analysis(self.job, title_only_analysis)
+            job_manager.save_chord_sheet(self.job, title_only_analysis.chord_sheet_text)
+            return title_only_analysis
+
         if not source_audio.exists():
-            analysis = SongAnalysis(provider=self.song_analyzer.name)
+            analysis = prepare_song_analysis_for_display(
+                SongAnalysis(provider=self.song_analyzer.name),
+                segments,
+                target_key=delivery_target_key,
+            )
             job_manager.save_song_analysis(self.job, analysis)
             job_manager.save_chord_sheet(self.job, render_chord_sheet_text(self.job.display_name, segments, analysis))
             return analysis
@@ -166,14 +267,46 @@ class KaraokePipeline:
             add_warning(self.job, "לא הצלחתי לזהות BPM ואקורדים, אז המשכתי בלי שכבת אקורדים מלאה.")
             analysis = SongAnalysis(provider=self.song_analyzer.name, source_audio=str(source_audio))
 
+        analysis = prepare_song_analysis_for_display(analysis, segments, target_key=delivery_target_key)
         job_manager.save_song_analysis(self.job, analysis)
         job_manager.save_chord_sheet(self.job, render_chord_sheet_text(self.job.display_name, segments, analysis))
         return analysis
 
+    def step_analyze_singers(self, segments: list[TranscriptSegment]) -> SingerAnalysisResult:
+        if self.job.singer_analysis_path.exists():
+            try:
+                existing = job_manager.load_singer_analysis(self.job)
+            except Exception as exc:
+                logger.warning("Could not read singer analysis for %s: %s", self.job.job_id, exc)
+            else:
+                if existing.provider == self.singer_analyzer.name and len(existing.assignments) == len(segments):
+                    return existing
+
+        if self.job.vocals_16k_path.exists():
+            singer_audio = str(self.job.vocals_16k_path)
+        elif self.job.vocals_path.exists():
+            singer_audio = self._ensure_vocals_wav(str(self.job.vocals_path))
+        else:
+            return SingerAnalysisResult(provider=self.singer_analyzer.name)
+
+        try:
+            analysis = self.singer_analyzer.analyze(singer_audio, segments, title=self.job.display_name)
+        except Exception as exc:
+            logger.warning("Singer analysis failed for %s: %s", self.job.job_id, exc)
+            add_warning(self.job, "לא הצלחתי להבחין בבטחה בין כמה זמרים, אז הקריוקי ירונדר בפריסה רגילה.")
+            return SingerAnalysisResult(provider=self.singer_analyzer.name)
+
+        if analysis.assignments:
+            job_manager.save_singer_analysis(self.job, analysis)
+        return analysis
+
     def step_post_review(self, job: Job, original_draft: TranscriptDraft):
-        """Run Steps 5-7 after human approval (char diff, Gemini validate, timing fix)."""
+        """Run Steps 5-7 after human approval (char diff, LLM validate, timing fix)."""
         if hasattr(self.lyrics_verifier, 'post_review_steps'):
             self.lyrics_verifier.post_review_steps(job, original_draft)
+
+    def can_realign_after_review(self) -> bool:
+        return self.job.vocals_16k_path.exists() or self.job.vocals_path.exists()
 
     def run_until_review(self, input_path: str | None = None) -> TranscriptDraft:
         audio_path = self.step_get_audio(input_path)
@@ -186,11 +319,48 @@ class KaraokePipeline:
 
     def run_after_review(self, approved_segments: list[TranscriptSegment], video_request: VideoRequest | None = None):
         draft_segments = job_manager.load_draft_segments(self.job)
+        review_mismatches_before = job_manager.find_segment_word_text_mismatches(approved_segments)
+        approved_segments = job_manager.rebuild_segments_from_authoritative_text(draft_segments, approved_segments)
+        review_mismatches_after = job_manager.find_segment_word_text_mismatches(approved_segments)
+        if review_mismatches_before and not review_mismatches_after:
+            add_warning(
+                self.job,
+                (
+                    "זוהתה אי-התאמה בין טקסט review לבין המילים המתוזמנות, "
+                    "ובוצע תיקון אוטומטי לפני היישור הסופי."
+                ),
+            )
+        if review_mismatches_after:
+            raise PipelineError(
+                "Approved review text could not be reconciled with the timed words.",
+                "זיהיתי חוסר התאמה בין טקסט האישור לבין המילים המתוזמנות, וגם אחרי תיקון אוטומטי זה לא הסתדר. "
+                "כדאי לשלוח שוב את הטקסט המלא של השיר או לעדכן את השורות הבעייתיות.",
+            )
+        job_manager.save_review_transcript(self.job, approved_segments)
+        shrink = job_manager.detect_suspicious_review_shrink(
+            draft_segments,
+            "\n".join(segment.text for segment in approved_segments if segment.text.strip()),
+        )
+        if shrink is not None:
+            raise PipelineError(
+                "Approved review text is suspiciously short compared to the draft transcript.",
+                "הטקסט שאושר קצר מדי ביחס לשיר, ולכן חלקים יישארו בלי כתוביות. "
+                "שלח את כל מילות השיר או תקן שורות בודדות לפני יצירת הקריוקי.",
+            )
         render_frame_rate = self._resolve_render_frame_rate(video_request)
+        if self.job.vocals_16k_path.exists():
+            alignment_audio = str(self.job.vocals_16k_path)
+        elif self.job.vocals_path.exists():
+            alignment_audio = self._ensure_vocals_wav(str(self.job.vocals_path))
+        else:
+            raise AlignmentError(
+                "No isolated vocals are available for review realignment.",
+                "אין קובץ ווקאל זמין כדי ליישר מחדש את הטקסט המתוקן.",
+            )
 
         self._update_status(JobStatus.ALIGNING)
         aligned = self.aligner.align(
-            str(self.job.vocals_16k_path),
+            alignment_audio,
             approved_segments,
             draft_segments,
             video_frame_rate=render_frame_rate,
@@ -202,14 +372,44 @@ class KaraokePipeline:
             add_warning(self.job, f"{aligned.unaligned_word_count} מילים יושרו באינטרפולציה ולא ביישור ישיר.")
         for timing_warning in validate_timing_quality(aligned.segments):
             add_warning(self.job, timing_warning)
+        quality_report = analyze_alignment_quality(aligned.segments)
+        if quality_report["critical"]:
+            raise AlignmentError(
+                f"Take-one quality gate failed: {quality_report}",
+                "לא הצלחתי להגיע לטיימינג ברמת טייק אחד אחרי כל ניסיונות היישור, אז עצרתי לפני יצירת קבצים לא מדויקים.",
+            )
+        if float(quality_report["score"]) < 0.93:
+            add_warning(
+                self.job,
+                (
+                    "איכות היישור טובה אבל עדיין לא מושלמת: "
+                    f"דיוק מילים {int(float(quality_report['aligned_ratio']) * 100)}%, "
+                    f"דיוק אותיות {int(float(quality_report['char_timing_ratio']) * 100)}%."
+                ),
+            )
         job_manager.save_final_transcript(self.job, aligned)
         analysis = self.step_analyze_music(aligned.segments)
+        singer_analysis = self.step_analyze_singers(aligned.segments)
 
         self._update_status(JobStatus.GENERATING_SUBS)
         style = get_style(self.job.manifest.style_preset)
-        self.srt_renderer.render(aligned.segments, str(self.job.srt_path), style=style)
-        self.ass_renderer.render(aligned.segments, str(self.job.ass_path), style=style, song_analysis=analysis)
-        for warning in self.subtitle_validator.validate(aligned.segments, style):
+        self.srt_renderer.render(
+            aligned.segments,
+            str(self.job.srt_path),
+            style=style,
+            singer_analysis=singer_analysis,
+        )
+        self.ass_renderer.render(
+            aligned.segments,
+            str(self.job.ass_path),
+            style=style,
+            song_analysis=analysis,
+            singer_analysis=singer_analysis,
+            include_chord_overlays=False,
+            include_hud=False,
+            include_next_line_preview=True,
+        )
+        for warning in self.subtitle_validator.validate(aligned.segments, style, singer_analysis=singer_analysis):
             add_warning(self.job, warning)
 
         if video_request and (video_request.with_vocals or video_request.without_vocals):
@@ -225,11 +425,26 @@ class KaraokePipeline:
             raise DownloadError("No saved timings available for rerender.")
 
         analysis = self.step_analyze_music(segments)
+        singer_analysis = self.step_analyze_singers(segments)
         self._update_status(JobStatus.GENERATING_SUBS)
         style = get_style(self.job.manifest.style_preset)
-        self.srt_renderer.render(segments, str(self.job.srt_path), style=style)
-        self.ass_renderer.render(segments, str(self.job.ass_path), style=style, song_analysis=analysis)
-        for warning in self.subtitle_validator.validate(segments, style):
+        self.srt_renderer.render(
+            segments,
+            str(self.job.srt_path),
+            style=style,
+            singer_analysis=singer_analysis,
+        )
+        self.ass_renderer.render(
+            segments,
+            str(self.job.ass_path),
+            style=style,
+            song_analysis=analysis,
+            singer_analysis=singer_analysis,
+            include_chord_overlays=False,
+            include_hud=False,
+            include_next_line_preview=True,
+        )
+        for warning in self.subtitle_validator.validate(segments, style, singer_analysis=singer_analysis):
             add_warning(self.job, warning)
 
         if video_request and (video_request.with_vocals or video_request.without_vocals):
@@ -326,6 +541,7 @@ class KaraokePipeline:
             "retries": 5,
             "fragment_retries": 5,
             "windowsfilenames": True,
+            **ytdlp_base_opts(),
         }
 
         try:
@@ -390,6 +606,7 @@ class KaraokePipeline:
             "retries": 5,
             "fragment_retries": 5,
             "windowsfilenames": True,
+            **ytdlp_base_opts(),
         }
 
         try:

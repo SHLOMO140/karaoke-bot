@@ -34,17 +34,18 @@ def _get_model():
 class FasterWhisperHebrewProvider:
     name = "faster_whisper_hebrew"
 
-    def transcribe(self, audio_path: str) -> TranscriptDraft:
+    def transcribe(self, audio_path: str, language: str | None = WHISPER_LANGUAGE) -> TranscriptDraft:
         model = _get_model()
+        transcribe_kwargs = {
+            "beam_size": WHISPER_BEAM_SIZE,
+            "word_timestamps": True,
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 300},
+        }
+        if language:
+            transcribe_kwargs["language"] = language
         try:
-            segments_gen, _info = model.transcribe(
-                audio_path,
-                language=WHISPER_LANGUAGE,
-                beam_size=WHISPER_BEAM_SIZE,
-                word_timestamps=True,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
-            )
+            segments_gen, _info = model.transcribe(audio_path, **transcribe_kwargs)
         except Exception as exc:
             raise TranscriptionError(str(exc)) from exc
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import yt_dlp
 
 from .audio_extractor import transcode_to_mp3
-from .config import FFMPEG_PATH, PYTHON_EXE, YTDLP_STAGING_DIR
+from .config import FFMPEG_PATH, HIGH_QUALITY_MP3_BITRATE, PYTHON_EXE, YTDLP_STAGING_DIR, ytdlp_base_opts
 from .exceptions import AudioExtractionError, DownloadError
 
 DOWNLOAD_DIR = Path("downloads")
@@ -19,10 +19,26 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 MAX_SIZE = 45 * 1024 * 1024
 STAGING_DIR = YTDLP_STAGING_DIR / "legacy_media"
 STAGING_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_CACHE_REVISION = "hq-v2"
 
 
 def safe_filename(title: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", title).strip() or "output"
+
+
+def split_artist_and_title(title: str) -> tuple[str, str]:
+    normalized = str(title or "").strip()
+    if not normalized:
+        return "", ""
+    for separator in (" - ", " – ", " — ", " | "):
+        if separator not in normalized:
+            continue
+        artist, song_title = normalized.split(separator, 1)
+        artist = artist.strip()
+        song_title = song_title.strip()
+        if artist and song_title:
+            return artist, song_title
+    return "", normalized
 
 
 def _cleanup(prefix: str):
@@ -48,9 +64,15 @@ def _extract_info(url: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        **ytdlp_base_opts(),
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def resolve_media_title(url: str) -> str:
+    info = _extract_info(url)
+    return str(info.get("title") or info.get("id") or "").strip()
 
 
 def _stage_path(prefix: str) -> Path:
@@ -75,11 +97,45 @@ def _pick_stage_file(stage_dir: Path, prefix: str) -> Path | None:
     return candidates[0]
 
 
+def _cache_marker(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".cache")
+
+
+def _has_current_cache(path: Path) -> bool:
+    marker = _cache_marker(path)
+    return path.exists() and path.stat().st_size > 0 and marker.exists() and marker.read_text(encoding="utf-8", errors="ignore").strip() == AUDIO_CACHE_REVISION
+
+
+def _write_cache_marker(path: Path):
+    _cache_marker(path).write_text(AUDIO_CACHE_REVISION, encoding="utf-8")
+
+
+def _download_best_audio_source(url: str, stage_dir: Path, prefix: str) -> Path:
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str((stage_dir / f"{prefix}.%(ext)s").resolve()),
+        "ffmpeg_location": str(FFMPEG_PATH),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "windowsfilenames": True,
+        **ytdlp_base_opts(),
+    }
+    _run_ydlp(url, ydl_opts, prefix)
+    src = _pick_stage_file(stage_dir, prefix)
+    if src is None:
+        raise DownloadError("No downloaded audio file was found after the download finished.")
+    return src
+
+
 def search_youtube(query: str, max_results: int = 5) -> list[dict[str, str]]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
+        **ytdlp_base_opts(),
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
@@ -107,29 +163,22 @@ def download_audio(url: str) -> tuple[str, str]:
     info = _extract_info(url)
     title = info.get("title", info.get("id", "audio"))
     dst = DOWNLOAD_DIR / f"{safe_filename(title)}.mp3"
-    if dst.exists() and dst.stat().st_size > 0:
+    if _has_current_cache(dst):
         return str(dst.resolve()), title
 
     stage_dir = _stage_path("audio")
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str((stage_dir / "audio.%(ext)s").resolve()),
-        "ffmpeg_location": str(FFMPEG_PATH),
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "windowsfilenames": True,
-    }
     try:
-        info = _run_ydlp(url, ydl_opts, "")
-        src = _pick_stage_file(stage_dir, "audio")
-        if src is None:
-            raise DownloadError("No downloaded audio file was found after the download finished.")
+        src = _download_best_audio_source(url, stage_dir, "audio")
         if dst.exists():
             dst.unlink()
-        transcode_to_mp3(str(src.resolve()), str(dst.resolve()))
+        artist, song_title = split_artist_and_title(str(title))
+        transcode_to_mp3(
+            str(src.resolve()),
+            str(dst.resolve()),
+            title=song_title or str(title),
+            artist=artist,
+        )
+        _write_cache_marker(dst)
         return str(dst.resolve()), title
     except AudioExtractionError:
         raise
@@ -148,7 +197,6 @@ def remove_vocals_demucs(input_path: str, output_path: str):
             "-m",
             "demucs",
             "--two-stems=vocals",
-            "--mp3",
             "-o",
             str(demucs_out),
             abs_input,
@@ -161,7 +209,10 @@ def remove_vocals_demucs(input_path: str, output_path: str):
             raise FileNotFoundError("לא נמצא no_vocals מהפרדת הווקאל.")
         no_vocals = str(no_vocals_files[0])
         if no_vocals.endswith(".wav"):
-            result2 = subprocess.run([ffmpeg_exe, "-y", "-i", no_vocals, "-q:a", "0", output_path], capture_output=True)
+            result2 = subprocess.run(
+                [ffmpeg_exe, "-y", "-i", no_vocals, "-c:a", "libmp3lame", "-b:a", HIGH_QUALITY_MP3_BITRATE, output_path],
+                capture_output=True,
+            )
             if result2.returncode != 0:
                 raise RuntimeError(result2.stderr.decode(errors="ignore")[-400:])
         else:
@@ -173,19 +224,20 @@ def remove_vocals_demucs(input_path: str, output_path: str):
 def download_audio_karaoke(url: str) -> tuple[str, str]:
     info = _extract_info(url)
     title = info.get("title", info.get("id", "karaoke"))
-    karaoke_path = str(DOWNLOAD_DIR.resolve() / f"{safe_filename(title)}_karaoke.mp3")
-    if Path(karaoke_path).exists() and Path(karaoke_path).stat().st_size > 0:
-        return karaoke_path, title
+    karaoke_path = DOWNLOAD_DIR.resolve() / f"{safe_filename(title)}_karaoke.mp3"
+    if _has_current_cache(karaoke_path):
+        return str(karaoke_path), title
 
-    cached_mp3_path = DOWNLOAD_DIR.resolve() / f"{safe_filename(title)}.mp3"
-    had_cached_mp3 = cached_mp3_path.exists() and cached_mp3_path.stat().st_size > 0
-    mp3_path, title = download_audio(url)
+    stage_dir = _stage_path("karaoke")
     try:
-        remove_vocals_demucs(mp3_path, karaoke_path)
+        src = _download_best_audio_source(url, stage_dir, "karaoke_source")
+        if karaoke_path.exists():
+            karaoke_path.unlink()
+        remove_vocals_demucs(str(src.resolve()), str(karaoke_path.resolve()))
+        _write_cache_marker(karaoke_path)
     finally:
-        if not had_cached_mp3:
-            Path(mp3_path).unlink(missing_ok=True)
-    return karaoke_path, title
+        _cleanup_stage(stage_dir)
+    return str(karaoke_path), title
 
 
 def compress_video(input_path: str, output_path: str, duration: float):
@@ -265,6 +317,7 @@ def download_video(url: str, quality: str) -> tuple[str, str]:
         "retries": 5,
         "fragment_retries": 5,
         "windowsfilenames": True,
+        **ytdlp_base_opts(),
     }
     try:
         info = _run_ydlp(url, ydl_opts, "")

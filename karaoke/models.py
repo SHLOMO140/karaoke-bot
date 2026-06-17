@@ -71,6 +71,7 @@ class LanguageDetectionResult:
 @dataclass
 class LyricsVerificationResult:
     provider: str = ""
+    llm_provider: str = ""
     verdict: str = "not_run"
     confidence: float = 0.0
     search_query: str = ""
@@ -219,7 +220,43 @@ class SongAnalysis:
     source_audio: str = ""
     beat_times: list[float] = field(default_factory=list)
     measure_times: list[float] = field(default_factory=list)
+    original_key: str = ""
+    target_key: str = ""
+    transpose_semitones: int = 0
+    original_chord_events: list[ChordEvent] = field(default_factory=list)
     chord_events: list[ChordEvent] = field(default_factory=list)
+    chord_sheet_text: str = ""
+    chord_source_name: str = ""
+    chord_source_url: str = ""
+
+
+@dataclass
+class SingerProfile:
+    singer_id: str
+    label: str
+    primary_color: str = ""
+    secondary_color: str = ""
+    outline_color: str = ""
+    shadow_color: str = ""
+    lane_index: int = 0
+
+
+@dataclass
+class SingerSegmentAssignment:
+    segment_index: int
+    singer_id: str
+    label: str = ""
+    confidence: float = 0.0
+
+
+@dataclass
+class SingerAnalysisResult:
+    detected_singer_count: int = 1
+    provider: str = ""
+    profiles: list[SingerProfile] = field(default_factory=list)
+    assignments: list[SingerSegmentAssignment] = field(default_factory=list)
+    low_confidence_segments: int = 0
+    analysis_window_seconds: float = 0.0
 
 
 @dataclass
@@ -269,10 +306,14 @@ class JobManifest:
     thumbnail_url: str = ""
     chat_id: int = 0
     user_id: int = 0
+    delivery_chat_id: int = 0
+    delivery_reply_to_message_id: int = 0
     status: str = JobStatus.CREATED.value
     review_status: str = ReviewStatus.NOT_STARTED.value
     style_preset: str = "blue_outline"
     requested_outputs: dict[str, object] = field(default_factory=dict)
+    pending_delivery: dict[str, object] = field(default_factory=dict)
+    quality_feedback: list[dict[str, object]] = field(default_factory=list)
     providers: dict[str, str] = field(default_factory=dict)
     language_info: dict[str, object] = field(default_factory=dict)
     lyrics_verification: dict[str, object] = field(default_factory=dict)
@@ -352,6 +393,38 @@ class Job:
         self.manifest.review_message_id = value
 
     @property
+    def delivery_chat_id(self) -> int:
+        return self.manifest.delivery_chat_id or self.manifest.chat_id
+
+    @delivery_chat_id.setter
+    def delivery_chat_id(self, value: int):
+        self.manifest.delivery_chat_id = value
+
+    @property
+    def delivery_reply_to_message_id(self) -> int:
+        return self.manifest.delivery_reply_to_message_id
+
+    @delivery_reply_to_message_id.setter
+    def delivery_reply_to_message_id(self, value: int):
+        self.manifest.delivery_reply_to_message_id = value
+
+    @property
+    def pending_delivery(self) -> dict[str, object]:
+        return self.manifest.pending_delivery or {}
+
+    @pending_delivery.setter
+    def pending_delivery(self, value: dict[str, object]):
+        self.manifest.pending_delivery = dict(value or {})
+
+    @property
+    def quality_feedback(self) -> list[dict[str, object]]:
+        return list(self.manifest.quality_feedback or [])
+
+    @quality_feedback.setter
+    def quality_feedback(self, value: list[dict[str, object]]):
+        self.manifest.quality_feedback = list(value or [])
+
+    @property
     def manifest_path(self) -> Path:
         return self.job_dir / "job.json"
 
@@ -428,5 +501,17 @@ class Job:
         return self.job_dir / "song_analysis.json"
 
     @property
+    def singer_analysis_path(self) -> Path:
+        return self.job_dir / "singer_analysis.json"
+
+    @property
     def lyrics_with_chords_path(self) -> Path:
         return self.job_dir / "lyrics_with_chords.txt"
+
+    @property
+    def delivery_feedback_path(self) -> Path:
+        return self.job_dir / "delivery_feedback.txt"
+
+    @property
+    def delivery_feedback_template_path(self) -> Path:
+        return self.job_dir / "delivery_feedback_template.txt"

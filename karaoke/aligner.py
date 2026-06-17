@@ -23,7 +23,7 @@ from .config import (
     ALIGNMENT_PROVIDER,
 )
 from .exceptions import AlignmentError
-from .models import AlignedTranscript, SubWordTiming, TranscriptSegment, WordTiming
+from .models import AlignedTranscript, CharacterTiming, SubWordTiming, TranscriptSegment, WordTiming
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,9 @@ MIN_WORD_DURATION_SEC = ALIGNMENT_MIN_WORD_DURATION_MS / 1000.0
 BOUNDARY_SEARCH_SEC = ALIGNMENT_BOUNDARY_SEARCH_MS / 1000.0
 MIN_SUBWORD_DURATION_SEC = 0.012
 HEBREW_NIQQUD_RANGE = range(0x05B0, 0x05C8)
+WHISPERX_SEGMENT_PADDING_SEC = 0.24
+WHISPERX_SEGMENT_RETRY_PADDING_SEC = 0.58
+DETAIL_CONFIDENCE_FLOOR = 0.55
 
 
 def _normalize_word(word: str) -> str:
@@ -122,6 +125,418 @@ def _rebuild_segments(template_segments: list[TranscriptSegment], final_words: l
             )
         )
     return rebuilt
+
+
+def _clone_segments(
+    segments: list[TranscriptSegment],
+    *,
+    mark_aligned: bool = False,
+    source: str | None = None,
+) -> list[TranscriptSegment]:
+    cloned: list[TranscriptSegment] = []
+    for segment in segments:
+        cloned_words = [
+            WordTiming(
+                word=word.word,
+                start=word.start,
+                end=word.end,
+                confidence=word.confidence,
+                source=source or word.source,
+                aligned=True if mark_aligned else word.aligned,
+                subwords=list(word.subwords),
+                char_timings=list(word.char_timings),
+            )
+            for word in segment.words
+        ]
+        cloned.append(
+            TranscriptSegment(
+                words=cloned_words,
+                text=segment.text,
+                start=segment.start,
+                end=segment.end,
+            )
+        )
+    return cloned
+
+
+def _max_inter_segment_gap(segments: list[TranscriptSegment]) -> float:
+    if len(segments) < 2:
+        return 0.0
+    return max(
+        0.0,
+        max(float(segments[index + 1].start) - float(segments[index].end) for index in range(len(segments) - 1)),
+    )
+
+
+def _max_word_gap_within_segment(segment: TranscriptSegment) -> float:
+    if len(segment.words) < 2:
+        return 0.0
+    return max(
+        0.0,
+        max(float(segment.words[index + 1].start) - float(segment.words[index].end) for index in range(len(segment.words) - 1)),
+    )
+
+
+def _has_suspicious_segment_timing(segments: list[TranscriptSegment]) -> bool:
+    for segment in segments:
+        word_count = max(1, len(segment.words))
+        span = float(segment.end) - float(segment.start)
+        if span > max(12.0, word_count * 1.8):
+            return True
+        if _max_word_gap_within_segment(segment) > max(3.5, span * 0.42):
+            return True
+    return False
+
+
+def _should_preserve_approved_timings(
+    candidate_segments: list[TranscriptSegment],
+    approved_segments: list[TranscriptSegment],
+) -> bool:
+    if not candidate_segments or not approved_segments:
+        return False
+
+    approved_duration = max(float(approved_segments[-1].end) - float(approved_segments[0].start), 0.01)
+    end_loss = float(approved_segments[-1].end) - float(candidate_segments[-1].end)
+    if end_loss > max(6.0, approved_duration * 0.08):
+        return True
+
+    if _has_suspicious_segment_timing(candidate_segments) and not _has_suspicious_segment_timing(approved_segments):
+        return True
+
+    approved_gap = _max_inter_segment_gap(approved_segments)
+    candidate_gap = _max_inter_segment_gap(candidate_segments)
+    return candidate_gap > max(12.0, approved_gap + 8.0, approved_gap * 2.2)
+
+
+def _sanitize_whisperx_metadata(model: object, metadata: dict[str, object]) -> dict[str, object]:
+    """Drop dictionary entries that are outside the model's emission dimension.
+
+    Some Hebrew wav2vec2 checkpoints expose tokenizer vocab entries such as
+    ``<pad>`` and ``</s>`` with ids that are larger than the CTC head output.
+    WhisperX later scans the dictionary for ``[pad]`` / ``<pad>`` and can pick
+    the out-of-range token as ``blank_id``, which crashes alignment before any
+    word timings are produced.
+    """
+    dictionary = metadata.get("dictionary")
+    if not isinstance(dictionary, dict) or not dictionary:
+        return metadata
+
+    output_size = None
+    lm_head = getattr(model, "lm_head", None)
+    out_features = getattr(lm_head, "out_features", None)
+    if isinstance(out_features, int) and out_features > 0:
+        output_size = out_features
+    else:
+        config = getattr(model, "config", None)
+        vocab_size = getattr(config, "vocab_size", None)
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            output_size = vocab_size
+
+    if output_size is None:
+        return metadata
+
+    safe_dictionary = {
+        char: code
+        for char, code in dictionary.items()
+        if isinstance(code, int) and 0 <= code < output_size
+    }
+    if not safe_dictionary:
+        return metadata
+
+    if len(safe_dictionary) != len(dictionary):
+        removed_tokens = sorted(
+            f"{char}={code}"
+            for char, code in dictionary.items()
+            if not isinstance(code, int) or code < 0 or code >= output_size
+        )
+        logger.debug(
+            "Sanitized WhisperX dictionary from %d to %d entries for output size %d (%s)",
+            len(dictionary),
+            len(safe_dictionary),
+            output_size,
+            ", ".join(removed_tokens),
+        )
+        sanitized = dict(metadata)
+        sanitized["dictionary"] = safe_dictionary
+        return sanitized
+
+    return metadata
+
+
+def _build_whisperx_payload_for_segment(segment: TranscriptSegment, padding_seconds: float) -> list[dict[str, object]]:
+    text = segment.text.strip()
+    if not text:
+        return []
+    start = max(0.0, segment.start - max(0.0, padding_seconds))
+    end = max(start + MIN_WORD_DURATION_SEC, segment.end + max(0.0, padding_seconds))
+    return [{"text": text, "start": round(start, 6), "end": round(end, 6)}]
+
+
+def _merge_whisperx_aligned_segments(
+    source_segment: TranscriptSegment,
+    aligned_segments: list[dict[str, object]],
+) -> dict[str, object]:
+    merged_words: list[dict[str, object]] = []
+    merged_chars: list[dict[str, object]] = []
+    starts: list[float] = []
+    ends: list[float] = []
+
+    for aligned_segment in aligned_segments:
+        for word in aligned_segment.get("words") or []:
+            merged_words.append(word)
+            if word.get("start") is not None:
+                starts.append(float(word["start"]))
+            if word.get("end") is not None:
+                ends.append(float(word["end"]))
+        for char in aligned_segment.get("chars") or []:
+            merged_chars.append(char)
+            if char.get("start") is not None:
+                starts.append(float(char["start"]))
+            if char.get("end") is not None:
+                ends.append(float(char["end"]))
+
+    return {
+        "text": source_segment.text,
+        "start": min(starts) if starts else source_segment.start,
+        "end": max(ends) if ends else source_segment.end,
+        "words": merged_words,
+        "chars": merged_chars,
+    }
+
+
+def _whisperx_segment_candidate_score(source_segment: TranscriptSegment, aligned_segment: dict[str, object] | None) -> float:
+    if not aligned_segment:
+        return float("-inf")
+
+    aligned_words = aligned_segment.get("words") or []
+    if not aligned_words:
+        return -10.0
+
+    expected_words = max(1, len(source_segment.words))
+    timed_words = sum(1 for word in aligned_words if word.get("start") is not None and word.get("end") is not None)
+    count_delta = abs(len(aligned_words) - len(source_segment.words))
+    confidence_values = [
+        float(word.get("score", 0.0))
+        for word in aligned_words
+        if word.get("start") is not None and word.get("end") is not None
+    ]
+    average_confidence = sum(confidence_values) / max(1, len(confidence_values))
+    segment_duration = max(source_segment.end - source_segment.start, MIN_WORD_DURATION_SEC)
+    expected_duration = segment_duration / expected_words
+    suspicious_duration_words = 0
+    longest_word_share = 0.0
+    duration_penalty = 0.0
+
+    for word in aligned_words:
+        if word.get("start") is None or word.get("end") is None:
+            continue
+        duration = max(float(word["end"]) - float(word["start"]), 0.0)
+        longest_word_share = max(longest_word_share, duration / segment_duration)
+        if duration > max(2.8, expected_duration * 2.4):
+            suspicious_duration_words += 1
+            duration_penalty += min(1.5, (duration / max(expected_duration, MIN_WORD_DURATION_SEC)) - 1.0)
+
+    return (
+        float(timed_words)
+        + min(len(aligned_words), expected_words) / expected_words
+        + average_confidence * 0.7
+        - count_delta * 0.35
+        - suspicious_duration_words * 0.65
+        - duration_penalty * 0.18
+        - max(0.0, longest_word_share - 0.42) * 2.5
+    )
+
+
+def _whisperx_segment_needs_retry(source_segment: TranscriptSegment, aligned_segment: dict[str, object] | None) -> bool:
+    if not aligned_segment:
+        return True
+
+    expected_words = len(source_segment.words)
+    aligned_words = aligned_segment.get("words") or []
+    if expected_words <= 0:
+        return not aligned_words
+    if not aligned_words:
+        return True
+
+    timed_words = sum(1 for word in aligned_words if word.get("start") is not None and word.get("end") is not None)
+    direct_ratio = timed_words / max(1, expected_words)
+    count_ratio = len(aligned_words) / max(1, expected_words)
+    segment_duration = max(source_segment.end - source_segment.start, MIN_WORD_DURATION_SEC)
+    expected_duration = segment_duration / max(1, expected_words)
+    longest_word_duration = 0.0
+    suspicious_duration_words = 0
+    confidence_values = []
+    for word in aligned_words:
+        if word.get("start") is None or word.get("end") is None:
+            continue
+        duration = max(float(word["end"]) - float(word["start"]), 0.0)
+        longest_word_duration = max(longest_word_duration, duration)
+        confidence_values.append(float(word.get("score", 0.0)))
+        if duration > max(2.8, expected_duration * 2.4):
+            suspicious_duration_words += 1
+    average_confidence = sum(confidence_values) / max(1, len(confidence_values))
+    return (
+        direct_ratio < 0.72
+        or count_ratio < 0.72
+        or suspicious_duration_words >= 2
+        or (suspicious_duration_words >= 1 and average_confidence < 0.55)
+        or (longest_word_duration > segment_duration * 0.5 and average_confidence < 0.7)
+    )
+
+
+def _map_source_words_to_whisperx_words(
+    source_words: list[WordTiming],
+    aligned_words: list[dict[str, object]],
+) -> dict[int, int]:
+    if not source_words or not aligned_words:
+        return {}
+
+    source_norm = [_normalize_word(word.word) for word in source_words]
+    aligned_norm = [_normalize_word(str(word.get("word", ""))) for word in aligned_words]
+    matcher = SequenceMatcher(None, source_norm, aligned_norm, autojunk=False)
+    mapping: dict[int, int] = {}
+
+    for tag, source_start, source_end, aligned_start, aligned_end in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(min(source_end - source_start, aligned_end - aligned_start)):
+                mapping[source_start + offset] = aligned_start + offset
+            continue
+        if tag != "replace":
+            continue
+
+        used_aligned: set[int] = set()
+        aligned_cursor = aligned_start
+        for source_index in range(source_start, source_end):
+            best_index = None
+            best_ratio = 0.0
+            for aligned_index in range(aligned_cursor, aligned_end):
+                if aligned_index in used_aligned:
+                    continue
+                ratio = SequenceMatcher(
+                    None,
+                    source_norm[source_index],
+                    aligned_norm[aligned_index],
+                    autojunk=False,
+                ).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_index = aligned_index
+                    if ratio > 0.96:
+                        break
+            if best_index is not None and best_ratio >= 0.4:
+                mapping[source_index] = best_index
+                used_aligned.add(best_index)
+                aligned_cursor = best_index + 1
+
+    return mapping
+
+
+def _can_reuse_whisperx_char_entries(
+    source_text: str,
+    aligned_text: str,
+    entries: list[dict[str, object]],
+) -> bool:
+    if not entries:
+        return False
+    if _normalize_word(source_text) == _normalize_word(aligned_text):
+        return True
+    return len(_split_graphemes(source_text)) == len(_split_graphemes(aligned_text))
+
+
+def _words_from_whisperx_segment(
+    source_segment: TranscriptSegment,
+    aligned_segment: dict[str, object] | None,
+) -> tuple[list[WordTiming], int]:
+    if not aligned_segment:
+        fallback_words = [
+            WordTiming(
+                word=word.word,
+                start=word.start,
+                end=word.end,
+                confidence=word.confidence,
+                source="forced_aligner",
+                aligned=False,
+                subwords=list(word.subwords),
+                char_timings=list(word.char_timings),
+            )
+            for word in source_segment.words
+        ]
+        return fallback_words, len(fallback_words)
+
+    words = []
+    unaligned_count = 0
+    aligned_words = aligned_segment.get("words") or []
+    mapping = _map_source_words_to_whisperx_words(source_segment.words, aligned_words)
+
+    for source_index, source_word in enumerate(source_segment.words):
+        aligned_index = mapping.get(source_index)
+        if aligned_index is None:
+            words.append(
+                WordTiming(
+                    word=source_word.word,
+                    start=source_word.start,
+                    end=source_word.end,
+                    confidence=source_word.confidence,
+                    source="forced_aligner",
+                    aligned=False,
+                    subwords=list(source_word.subwords),
+                    char_timings=list(source_word.char_timings),
+                )
+            )
+            unaligned_count += 1
+            continue
+
+        word_data = aligned_words[aligned_index]
+        start = float(word_data.get("start", source_word.start))
+        end = float(word_data.get("end", source_word.end))
+        aligned = "start" in word_data and "end" in word_data
+        if not aligned:
+            unaligned_count += 1
+
+        aligned_text = str(word_data.get("word", "")).strip()
+        direct_chars = list(word_data.get("chars") or [])
+        confidence = float(word_data.get("score", source_word.confidence))
+        if _can_reuse_whisperx_char_entries(source_word.word, aligned_text, direct_chars):
+            subwords = _build_subwords_from_char_entries(
+                source_word.word,
+                direct_chars,
+                start,
+                end,
+                confidence,
+            )
+        else:
+            subwords = _uniform_subword_timings(_split_graphemes(source_word.word), start, end, confidence)
+
+        words.append(
+            WordTiming(
+                word=source_word.word,
+                start=start,
+                end=end,
+                confidence=confidence,
+                source="forced_aligner",
+                aligned=aligned,
+                subwords=subwords,
+                char_timings=_character_timings_from_subwords(subwords),
+            )
+        )
+
+    if words:
+        return words, unaligned_count
+
+    fallback_words = [
+        WordTiming(
+            word=word.word,
+            start=word.start,
+            end=word.end,
+            confidence=word.confidence,
+            source="forced_aligner",
+            aligned=False,
+            subwords=list(word.subwords),
+            char_timings=list(word.char_timings),
+        )
+        for word in source_segment.words
+    ]
+    return fallback_words, len(fallback_words)
 
 
 def _interpolate_word(
@@ -554,9 +969,29 @@ def _find_word_offset(word: WordTiming, energy: np.ndarray, hop_seconds: float,
 
     anchor_index = _time_to_index(word.end, hop_seconds, len(energy))
 
-    # For offsets: find the energy valley between this word's body and the
-    # next word's onset. Use spectral flux to identify where the next onset
-    # begins — the offset should be just before it.
+    # PRIMARY: if a detected onset exists just after the anchor, the word
+    # must end *before* that onset (the onset belongs to the next word).
+    # Find the energy minimum between the anchor and that onset.
+    if features is not None and features.onsets.size > 0:
+        # Look for the first onset AFTER the word's energy peak
+        word_body_start = _time_to_index(word.start, hop_seconds, len(energy))
+        word_peak = word_body_start + int(np.argmax(energy[word_body_start:anchor_index + 1])) if anchor_index > word_body_start else anchor_index
+        after_mask = features.onsets > word_peak
+        max_forward = int(round(search_forward / hop_seconds))
+        after_onsets = features.onsets[after_mask]
+        near_after = after_onsets[(after_onsets - anchor_index) <= max_forward]
+        if near_after.size > 0:
+            next_onset = int(near_after[0])
+            # The offset is the energy minimum between the peak and the next onset
+            valley_region = energy[word_peak:next_onset]
+            if valley_region.size > 0:
+                valley_idx = word_peak + int(np.argmin(valley_region))
+                # Only use if the valley is after at least 60% of the word
+                word_60 = word_body_start + int(0.6 * (anchor_index - word_body_start))
+                if valley_idx >= word_60:
+                    return _index_to_time(valley_idx, hop_seconds)
+
+    # SECONDARY: multi-signal offset scoring
     if features is not None and features.zcr.size > 0:
         local_energy_norm = _normalize_curve(local)
         local_sf = features.spectral_flux[start_index:end_index + 1]
@@ -569,9 +1004,11 @@ def _find_word_offset(word: WordTiming, energy: np.ndarray, hop_seconds: float,
         max_dist = max(1.0, distance.max())
         proximity = distance / max_dist
 
-        # Score to minimize: want low energy + close to anchor; spectral flux
-        # peaks indicate the NEXT word's onset so penalize them slightly
-        offset_score = local_energy_norm * 0.35 + sf_norm * 0.20 + proximity * 0.45
+        # Score to minimize: want low energy (vocal ended) + spectral flux
+        # peaks indicate the NEXT word's onset so penalize them.
+        # Proximity is a light tiebreaker — the energy drop should decide the
+        # offset, not the original Whisper anchor which can be inaccurate.
+        offset_score = local_energy_norm * 0.50 + sf_norm * 0.25 + proximity * 0.25
         # Only consider candidates after the energy peak (don't jump backwards)
         peak_local = int(np.argmax(local[:max(1, anchor_index - start_index + 1)]))
         offset_score[:peak_local] = float('inf')
@@ -719,14 +1156,24 @@ def _apply_frame_snapping(words: list[WordTiming], frame_rate: float | None) -> 
         # karaoke appear to start too early.
         start = max(cursor, round(word.start / frame_duration) * frame_duration)
         end = max(start + frame_duration, math.ceil(word.end / frame_duration) * frame_duration)
+        snapped_word = WordTiming(
+            word=word.word,
+            start=round(start, 6),
+            end=round(end, 6),
+            confidence=word.confidence,
+            source=word.source,
+            aligned=word.aligned,
+        )
         snapped_words.append(
             WordTiming(
-                word=word.word,
-                start=round(start, 6),
-                end=round(end, 6),
-                confidence=word.confidence,
-                source=word.source,
-                aligned=word.aligned,
+                word=snapped_word.word,
+                start=snapped_word.start,
+                end=snapped_word.end,
+                confidence=snapped_word.confidence,
+                source=snapped_word.source,
+                aligned=snapped_word.aligned,
+                subwords=_scale_existing_subwords(word, snapped_word),
+                char_timings=_scale_existing_char_timings(word, snapped_word),
             )
         )
         cursor = end
@@ -743,6 +1190,132 @@ def _boundary_search_radius(start_index: int, end_index: int, grapheme_count: in
     max_radius = max(1, int(0.08 / hop_seconds))
     min_radius = max(1, int(MIN_SUBWORD_DURATION_SEC / hop_seconds) * 2)
     return max(min_radius, min(max_radius, base))
+
+
+def _character_timings_from_subwords(subwords: list[SubWordTiming]) -> list[CharacterTiming]:
+    return [
+        CharacterTiming(
+            char=subword.text,
+            start=round(subword.start, 6),
+            end=round(subword.end, 6),
+        )
+        for subword in subwords
+        if subword.text
+    ]
+
+
+def _word_detail_alignment_is_reliable(word: WordTiming) -> bool:
+    graphemes = _split_graphemes(word.word)
+    if not word.aligned or not graphemes or not word.subwords:
+        return False
+    if len(word.subwords) != len(graphemes):
+        return False
+    if [subword.text for subword in word.subwords] != graphemes:
+        return False
+
+    previous_end = word.start
+    total_confidence = 0.0
+    for subword in word.subwords:
+        if subword.start < word.start - 0.02 or subword.end > word.end + 0.02:
+            return False
+        if subword.start < previous_end - 1e-3 or subword.end <= subword.start:
+            return False
+        previous_end = subword.end
+        total_confidence += max(0.0, subword.confidence)
+
+    average_confidence = total_confidence / max(1, len(word.subwords))
+    return average_confidence >= max(0.45, word.confidence * 0.55)
+
+
+def _char_timings_match_word_graphemes(word: WordTiming) -> bool:
+    graphemes = _split_graphemes(word.word)
+    if not graphemes or len(word.char_timings) != len(graphemes):
+        return False
+    if [char_timing.char for char_timing in word.char_timings] != graphemes:
+        return False
+
+    previous_end = word.start
+    for char_timing in word.char_timings:
+        if char_timing.start < word.start - 0.02 or char_timing.end > word.end + 0.02:
+            return False
+        if char_timing.start < previous_end - 1e-3 or char_timing.end <= char_timing.start:
+            return False
+        previous_end = char_timing.end
+    return True
+
+
+def _repair_aligned_word_details(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    repaired_segments: list[TranscriptSegment] = []
+
+    for segment in segments:
+        repaired_words: list[WordTiming] = []
+        for word in segment.words:
+            if not word.aligned or _word_detail_alignment_is_reliable(word):
+                repaired_words.append(word)
+                continue
+
+            graphemes = _split_graphemes(word.word)
+            if not graphemes:
+                repaired_words.append(word)
+                continue
+
+            detail_confidence = max(DETAIL_CONFIDENCE_FLOOR, word.confidence)
+            if _char_timings_match_word_graphemes(word):
+                char_timings = [
+                    CharacterTiming(
+                        char=char_timing.char,
+                        start=round(char_timing.start, 6),
+                        end=round(char_timing.end, 6),
+                    )
+                    for char_timing in word.char_timings
+                ]
+                subwords = [
+                    SubWordTiming(
+                        text=char_timing.char,
+                        start=char_timing.start,
+                        end=char_timing.end,
+                        confidence=detail_confidence,
+                    )
+                    for char_timing in char_timings
+                    if char_timing.char
+                ]
+            else:
+                subwords = _uniform_subword_timings(graphemes, word.start, word.end, detail_confidence)
+                char_timings = _character_timings_from_subwords(subwords)
+
+            repaired_words.append(
+                WordTiming(
+                    word=word.word,
+                    start=word.start,
+                    end=word.end,
+                    confidence=word.confidence,
+                    source=word.source,
+                    aligned=word.aligned,
+                    subwords=subwords,
+                    char_timings=char_timings,
+                )
+            )
+
+        repaired_segments.append(
+            TranscriptSegment(
+                words=repaired_words,
+                text=segment.text,
+                start=segment.start,
+                end=segment.end,
+            )
+        )
+
+    return repaired_segments
+
+
+def _should_preserve_existing_word_details(source_word: WordTiming, target_word: WordTiming) -> bool:
+    if not _word_detail_alignment_is_reliable(source_word):
+        return False
+
+    source_duration = max(source_word.end - source_word.start, 1e-6)
+    target_duration = max(target_word.end - target_word.start, 1e-6)
+    duration_ratio = target_duration / source_duration
+    return 0.6 <= duration_ratio <= 1.7
 
 
 def _scale_existing_subwords(source_word: WordTiming, target_word: WordTiming) -> list[SubWordTiming]:
@@ -782,6 +1355,46 @@ def _scale_existing_subwords(source_word: WordTiming, target_word: WordTiming) -
     if scaled:
         scaled[0].start = target_word.start
         scaled[-1].end = target_word.end
+    return scaled
+
+
+def _scale_existing_char_timings(source_word: WordTiming, target_word: WordTiming) -> list[CharacterTiming]:
+    source_timings = list(source_word.char_timings) or _character_timings_from_subwords(source_word.subwords)
+    if not source_timings:
+        return []
+
+    old_duration = max(source_word.end - source_word.start, 1e-6)
+    new_duration = max(target_word.end - target_word.start, MIN_WORD_DURATION_SEC)
+    remaining_count = len(source_timings)
+    cursor = target_word.start
+    scaled: list[CharacterTiming] = []
+
+    for index, char_timing in enumerate(source_timings):
+        start_ratio = (char_timing.start - source_word.start) / old_duration
+        end_ratio = (char_timing.end - source_word.start) / old_duration
+        proposed_start = target_word.start + start_ratio * new_duration
+        proposed_end = target_word.start + end_ratio * new_duration
+
+        start = target_word.start if index == 0 else max(cursor, proposed_start)
+        minimum_end = start + MIN_SUBWORD_DURATION_SEC
+        remaining_count -= 1
+        max_end = target_word.end - remaining_count * MIN_SUBWORD_DURATION_SEC
+        end = target_word.end if index == len(source_timings) - 1 else min(proposed_end, max_end)
+        end = max(minimum_end, end)
+        end = min(target_word.end, end)
+
+        scaled.append(
+            CharacterTiming(
+                char=char_timing.char,
+                start=round(start, 6),
+                end=round(end, 6),
+            )
+        )
+        cursor = end
+
+    if scaled:
+        scaled[0].start = round(target_word.start, 6)
+        scaled[-1].end = round(target_word.end, 6)
     return scaled
 
 
@@ -1142,10 +1755,17 @@ def _refine_word_timings(
         # Linear scaling (_scale_existing_subwords) preserves proportions but
         # ignores the actual audio — energy+ZCR analysis gives more accurate
         # letter-level boundaries.
-        subwords = _build_subword_timings(target_word, energy, hop_seconds, features=features)
-        if not subwords:
-            # Fallback: if energy analysis fails, use scaled existing subwords
+        if _should_preserve_existing_word_details(source_word, target_word):
             subwords = _scale_existing_subwords(source_word, target_word)
+            char_timings = _scale_existing_char_timings(source_word, target_word)
+        else:
+            subwords = _build_subword_timings(target_word, energy, hop_seconds, features=features)
+            if not subwords:
+                # Fallback: if energy analysis fails, use scaled existing subwords
+                subwords = _scale_existing_subwords(source_word, target_word)
+            char_timings = _character_timings_from_subwords(subwords)
+            if not char_timings:
+                char_timings = _scale_existing_char_timings(source_word, target_word)
         final_words.append(
             WordTiming(
                 word=target_word.word,
@@ -1155,6 +1775,7 @@ def _refine_word_timings(
                 source=target_word.source,
                 aligned=target_word.aligned,
                 subwords=subwords,
+                char_timings=char_timings,
             )
         )
     return final_words
@@ -1301,7 +1922,6 @@ def _refine_segments(
 ) -> list[TranscriptSegment]:
     minimum_step = 1.0 / video_frame_rate if video_frame_rate and video_frame_rate > 0 else MIN_WORD_DURATION_SEC
     refined_segments = []
-    prev_end = 0.0
     for segment in segments:
         if not segment.words:
             refined_segments.append(segment)
@@ -1313,20 +1933,10 @@ def _refine_segments(
             start=refined_words[0].start,
             end=refined_words[-1].end,
         )
-        # Cross-segment safety net: ensure this segment starts after the previous one ends.
-        if refined_segment.start < prev_end - 1e-6:
-            logger.debug(
-                "Cross-segment overlap detected: segment '%s' starts at %.3f but previous ended at %.3f — clamping.",
-                refined_segment.text[:30],
-                refined_segment.start,
-                prev_end,
-            )
-            refined_segment = _clamp_segment_to_floor(refined_segment, prev_end, minimum_step)
-        prev_end = refined_segment.end
         refined_segments.append(refined_segment)
-    # Second pass: clip each segment's end to the start of the following one.
-    # The first pass only guards against a segment *starting* too early; the
-    # last word's energy-search can still push segment[i].end past segment[i+1].start.
+    # Resolve cross-segment overlaps by clipping the previous segment to the
+    # next segment's onset. Preserving the next onset is usually more accurate
+    # than shifting an entire aligned segment forward.
     return _clip_segment_overlaps(refined_segments, minimum_step)
 
 
@@ -1379,6 +1989,7 @@ def _validate_final_segments(segments: list[TranscriptSegment]) -> list[Transcri
                 source=word.source,
                 aligned=word.aligned,
                 subwords=fixed_subwords,
+                char_timings=_character_timings_from_subwords(fixed_subwords),
             ))
             cursor = end
 
@@ -1485,6 +2096,14 @@ class SequenceHebrewAligner:
         segments = _rebuild_segments(approved_segments, built_words)
         segments = _refine_segments(audio_path, segments, video_frame_rate=video_frame_rate)
         segments = _validate_final_segments(segments)
+        if _should_preserve_approved_timings(segments, approved_segments):
+            logger.warning(
+                "Sequence aligner coverage regressed from %.2fs to %.2fs; keeping approved timings instead.",
+                float(approved_segments[-1].end),
+                float(segments[-1].end),
+            )
+            segments = _clone_segments(approved_segments, mark_aligned=True, source="forced_aligner")
+        segments = _repair_aligned_word_details(segments)
         unaligned_count = sum(1 for segment in segments for word in segment.words if not word.aligned)
         return AlignedTranscript(
             segments=segments,
@@ -1524,93 +2143,64 @@ class WhisperXHebrewAligner:
             raise AlignmentError(str(exc), "מנוע היישור whisperx לא מותקן.") from exc
 
         model, metadata = self._load()
-        payload = [
-            {"text": segment.text, "start": segment.start, "end": segment.end}
-            for segment in approved_segments
-            if segment.text.strip()
-        ]
+        metadata = _sanitize_whisperx_metadata(model, metadata)
         try:
             audio = whisperx.load_audio(audio_path)
-            result = whisperx.align(payload, model, metadata, audio, "cpu", return_char_alignments=True)
         except Exception as exc:
-            raise AlignmentError(str(exc), "whisperx נכשל ביישור הטקסט המאושר.") from exc
+            raise AlignmentError(str(exc), "whisperx נכשל בטעינת האודיו ליישור.") from exc
 
         final_segments = []
         unaligned_count = 0
-        for source_segment, aligned_segment in zip(approved_segments, result.get("segments", [])):
-            words = []
-            aligned_words = aligned_segment.get("words") or []
-            segment_chars = aligned_segment.get("chars") or []
-            segment_char_cursor = 0
-            fallback_words = source_segment.words
-            for index, word_data in enumerate(aligned_words):
-                fallback = fallback_words[min(index, len(fallback_words) - 1)] if fallback_words else None
-                start = word_data.get("start", fallback.start if fallback else source_segment.start)
-                end = word_data.get("end", fallback.end if fallback else source_segment.end)
-                aligned = "start" in word_data and "end" in word_data
-                if not aligned:
-                    unaligned_count += 1
-                word_text = str(word_data.get("word", "")).strip()
-                direct_chars = word_data.get("chars") or []
-                if direct_chars:
-                    subwords = _build_subwords_from_char_entries(
-                        word_text,
-                        direct_chars,
-                        float(start),
-                        float(end),
-                        float(word_data.get("score", 0.0)),
-                    )
-                else:
-                    needed_codepoints = len("".join(_split_graphemes(word_text)))
-                    collected_chars: list[dict[str, object]] = []
-                    while segment_char_cursor < len(segment_chars) and len(collected_chars) < needed_codepoints:
-                        entry = segment_chars[segment_char_cursor]
-                        segment_char_cursor += 1
-                        if not str(entry.get("char", "")).strip():
-                            continue
-                        collected_chars.append(entry)
-                    subwords = _build_subwords_from_char_entries(
-                        word_text,
-                        collected_chars,
-                        float(start),
-                        float(end),
-                        float(word_data.get("score", 0.0)),
-                    )
-                words.append(
-                    WordTiming(
-                        word=word_text,
-                        start=float(start),
-                        end=float(end),
-                        confidence=float(word_data.get("score", 0.0)),
-                        source="forced_aligner",
-                        aligned=aligned,
-                        subwords=subwords,
-                    )
+        any_success = False
+        for source_segment in approved_segments:
+            if not source_segment.text.strip():
+                final_segments.append(source_segment)
+                continue
+
+            best_candidate: dict[str, object] | None = None
+            last_error: Exception | None = None
+            for padding_seconds in (WHISPERX_SEGMENT_PADDING_SEC, WHISPERX_SEGMENT_RETRY_PADDING_SEC):
+                payload = _build_whisperx_payload_for_segment(source_segment, padding_seconds)
+                if not payload:
+                    continue
+                try:
+                    result = whisperx.align(payload, model, metadata, audio, "cpu", return_char_alignments=True)
+                    candidate = _merge_whisperx_aligned_segments(source_segment, result.get("segments", []))
+                except Exception as exc:
+                    last_error = exc
+                    candidate = None
+                if _whisperx_segment_candidate_score(source_segment, candidate) > _whisperx_segment_candidate_score(source_segment, best_candidate):
+                    best_candidate = candidate
+                if not _whisperx_segment_needs_retry(source_segment, best_candidate):
+                    break
+
+            if best_candidate:
+                any_success = True
+            elif last_error is not None:
+                logger.warning(
+                    "WhisperX segment alignment failed for '%s': %s",
+                    source_segment.text[:40],
+                    last_error,
                 )
-            if not words:
-                words = [
-                    WordTiming(
-                        word=word.word,
-                        start=word.start,
-                        end=word.end,
-                        confidence=word.confidence,
-                        source="forced_aligner",
-                        aligned=False,
-                    )
-                    for word in source_segment.words
-                ]
-                unaligned_count += len(words)
+
+            words, segment_unaligned_count = _words_from_whisperx_segment(source_segment, best_candidate)
+            unaligned_count += segment_unaligned_count
             final_segments.append(
                 TranscriptSegment(
                     words=words,
-                    text=" ".join(word.word for word in words).strip(),
+                    text=source_segment.text,
                     start=words[0].start,
                     end=words[-1].end,
                 )
             )
 
+        if not any_success and approved_segments:
+            raise AlignmentError("WhisperX could not align any approved segments.", "whisperx נכשל ביישור הטקסט המאושר.")
+
         final_segments = _refine_segments(audio_path, final_segments, video_frame_rate=video_frame_rate)
         final_segments = _validate_final_segments(final_segments)
+        final_segments = _repair_aligned_word_details(final_segments)
+        unaligned_count = sum(1 for segment in final_segments for word in segment.words if not word.aligned)
         return AlignedTranscript(
             segments=final_segments,
             provider=self.name,
@@ -1626,6 +2216,20 @@ class AutoHebrewAligner:
         self.primary = WhisperXHebrewAligner() if importlib.util.find_spec("whisperx") is not None else None
         self.fallback = SequenceHebrewAligner()
         self.last_warning_message = ""
+
+    @staticmethod
+    def _should_probe_fallback(result: AlignedTranscript) -> bool:
+        report = analyze_alignment_quality(result.segments)
+        return (
+            bool(report["critical"])
+            or result.unaligned_word_count > 0
+            or float(report["score"]) < 0.78
+            or int(report["warning_count"]) >= 2
+        )
+
+    @staticmethod
+    def _quality_score(result: AlignedTranscript) -> float:
+        return float(analyze_alignment_quality(result.segments)["score"])
 
     def align(
         self,
@@ -1644,12 +2248,31 @@ class AutoHebrewAligner:
             )
 
         try:
-            return self.primary.align(
+            primary_result = self.primary.align(
                 audio_path,
                 approved_segments,
                 draft_segments,
                 video_frame_rate=video_frame_rate,
             )
+            if not self._should_probe_fallback(primary_result):
+                return primary_result
+
+            logger.warning(
+                "Primary aligner quality is below threshold (score=%.3f, unaligned=%d). Probing fallback.",
+                self._quality_score(primary_result),
+                primary_result.unaligned_word_count,
+            )
+            fallback_result = self.fallback.align(
+                audio_path,
+                approved_segments,
+                draft_segments,
+                video_frame_rate=video_frame_rate,
+            )
+            if self._quality_score(fallback_result) > self._quality_score(primary_result) + 0.02:
+                self.last_warning_message = "מנוע היישור הראשי עבד, אבל היישור החלופי יצא מדויק ויציב יותר ולכן נבחר אוטומטית."
+                return fallback_result
+            self.last_warning_message = "מנוע היישור הראשי השלים יישור, אבל האיכות גבולית ולכן נבדקה גם חלופה אוטומטית."
+            return primary_result
         except AlignmentError as exc:
             self.last_warning_message = "מנוע היישור הראשי נכשל על הטקסט הזה, אז עברתי אוטומטית ליישור חלופי יציב יותר."
             logger.warning("WhisperX alignment failed, falling back to sequence aligner: %s", exc)
@@ -1754,6 +2377,57 @@ def validate_timing_quality(segments: list[TranscriptSegment]) -> list[str]:
         warnings.append(f"נמצאו {subword_violations} בעיות בטיימינג תת-מילתי — עלול להשפיע על אנימציית הגרפמות.")
 
     return warnings
+
+
+def analyze_alignment_quality(segments: list[TranscriptSegment]) -> dict[str, float | int | bool]:
+    total_words = 0
+    aligned_words = 0
+    char_timed_words = 0
+    reliable_detail_words = 0
+
+    for segment in segments:
+        for word in segment.words:
+            total_words += 1
+            if word.aligned:
+                aligned_words += 1
+            grapheme_count = len(_split_graphemes(word.word))
+            if grapheme_count and len(word.char_timings) >= grapheme_count:
+                char_timed_words += 1
+            if _word_detail_alignment_is_reliable(word):
+                reliable_detail_words += 1
+
+    warning_count = len(validate_timing_quality(segments))
+    if total_words == 0:
+        return {
+            "total_words": 0,
+            "aligned_ratio": 0.0,
+            "char_timing_ratio": 0.0,
+            "detail_ratio": 0.0,
+            "warning_count": warning_count,
+            "score": 0.0,
+            "critical": True,
+        }
+
+    aligned_ratio = aligned_words / total_words
+    char_timing_ratio = char_timed_words / total_words
+    detail_ratio = reliable_detail_words / total_words
+    warning_penalty = min(0.45, warning_count * 0.08)
+    score = aligned_ratio * 0.50 + char_timing_ratio * 0.30 + detail_ratio * 0.20 - warning_penalty
+    critical = (
+        aligned_ratio < 0.72
+        or (aligned_ratio < 0.88 and char_timing_ratio < 0.75)
+        or detail_ratio < 0.45
+        or warning_count >= 4
+    )
+    return {
+        "total_words": total_words,
+        "aligned_ratio": round(aligned_ratio, 6),
+        "char_timing_ratio": round(char_timing_ratio, 6),
+        "detail_ratio": round(detail_ratio, 6),
+        "warning_count": warning_count,
+        "score": round(score, 6),
+        "critical": critical,
+    }
 
 
 def realign_changed_words(

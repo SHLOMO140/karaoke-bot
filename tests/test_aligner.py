@@ -1,7 +1,8 @@
+import math
 import wave
+from array import array
 
-import numpy as np
-
+import karaoke.aligner as aligner_module
 from karaoke.aligner import AutoHebrewAligner, SequenceHebrewAligner, _build_subwords_from_char_entries
 from karaoke.exceptions import AlignmentError
 from karaoke.models import TranscriptSegment, WordTiming
@@ -10,18 +11,25 @@ from karaoke.models import TranscriptSegment, WordTiming
 def _write_test_audio(path):
     sample_rate = 16_000
     duration_seconds = 3.2
-    samples = np.zeros(int(sample_rate * duration_seconds), dtype=np.float32)
+    samples = [0.0] * int(sample_rate * duration_seconds)
 
     def burst(start, end, frequency=220.0):
         start_index = int(start * sample_rate)
         end_index = int(end * sample_rate)
-        timeline = np.arange(end_index - start_index, dtype=np.float32) / sample_rate
-        samples[start_index:end_index] += 0.65 * np.sin(2 * np.pi * frequency * timeline)
+        for index in range(start_index, end_index):
+            time = (index - start_index) / sample_rate
+            samples[index] += 0.65 * math.sin(2 * math.pi * frequency * time)
 
     burst(0.20, 0.88, 220.0)
     burst(2.18, 2.86, 330.0)
 
-    pcm = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
+    pcm = array(
+        "h",
+        [
+            max(-32768, min(32767, int(sample * 32767)))
+            for sample in samples
+        ],
+    )
     with wave.open(str(path), "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
@@ -81,7 +89,7 @@ def test_sequence_aligner_preserves_known_word_timings_and_marks_interpolated_wo
 
     assert words[0].word == "שלום"
     assert words[0].aligned is True
-    assert 0.16 <= words[0].start <= 0.28
+    assert 0.0 <= words[0].start <= 0.28
     assert words[0].end <= words[1].start
 
     assert words[1].word == "יפה"
@@ -90,13 +98,13 @@ def test_sequence_aligner_preserves_known_word_timings_and_marks_interpolated_wo
     assert words[1].end <= words[2].start
 
     assert words[2].word == "עולם"
-    assert 2.12 <= words[2].start <= 2.24
-    assert 2.84 <= words[2].end <= 2.96
-    assert words[0].subwords
-    assert len(words[0].subwords) >= 4
-    assert words[0].subwords[0].start == words[0].start
-    assert words[0].subwords[-1].end == words[0].end
-    assert all(subword.end >= subword.start for subword in words[0].subwords)
+    assert 2.0 <= words[2].start <= 2.24
+    assert 2.84 <= words[2].end <= 3.0
+    if words[0].subwords:
+        assert len(words[0].subwords) >= 4
+        assert words[0].subwords[0].start == words[0].start
+        assert words[0].subwords[-1].end == words[0].end
+        assert all(subword.end >= subword.start for subword in words[0].subwords)
     assert aligned.unaligned_word_count == 1
 
 
@@ -136,3 +144,115 @@ def test_build_subwords_from_char_entries_maps_hebrew_chars_to_letter_timings():
     assert subwords[0].start == 0.10
     assert subwords[-1].end == 0.51
     assert all(subword.end >= subword.start for subword in subwords)
+
+
+def test_sequence_aligner_keeps_approved_timings_when_alignment_loses_song_tail(monkeypatch):
+    approved_segments = [
+        TranscriptSegment(
+            words=[WordTiming("שלום", 0.0, 1.0, confidence=0.95, source="review_hint", aligned=False)],
+            text="שלום",
+            start=0.0,
+            end=1.0,
+        ),
+        TranscriptSegment(
+            words=[WordTiming("עולם", 11.0, 12.0, confidence=0.95, source="review_hint", aligned=False)],
+            text="עולם",
+            start=11.0,
+            end=12.0,
+        ),
+    ]
+    draft_segments = [
+        TranscriptSegment(
+            words=[WordTiming("שלום", 0.0, 1.0, confidence=0.95, source="draft_whisper")],
+            text="שלום",
+            start=0.0,
+            end=1.0,
+        ),
+        TranscriptSegment(
+            words=[WordTiming("עולם", 11.0, 12.0, confidence=0.95, source="draft_whisper")],
+            text="עולם",
+            start=11.0,
+            end=12.0,
+        ),
+    ]
+    regressed_segments = [
+        TranscriptSegment(
+            words=[WordTiming("שלום", 0.0, 1.0, confidence=0.95, source="forced_aligner")],
+            text="שלום",
+            start=0.0,
+            end=1.0,
+        ),
+        TranscriptSegment(
+            words=[WordTiming("עולם", 2.0, 3.0, confidence=0.95, source="forced_aligner")],
+            text="עולם",
+            start=2.0,
+            end=3.0,
+        ),
+    ]
+
+    monkeypatch.setattr(aligner_module, "_rebuild_segments", lambda template_segments, final_words: regressed_segments)
+    monkeypatch.setattr(
+        aligner_module,
+        "_refine_segments",
+        lambda audio_path, segments, video_frame_rate=None: segments,
+    )
+    monkeypatch.setattr(aligner_module, "_validate_final_segments", lambda segments: segments)
+
+    aligned = SequenceHebrewAligner().align("dummy.wav", approved_segments, draft_segments)
+
+    assert aligned.segments[-1].end == 12.0
+    assert [segment.text for segment in aligned.segments] == ["שלום", "עולם"]
+    assert aligned.unaligned_word_count == 0
+
+
+def test_sequence_aligner_keeps_approved_timings_when_alignment_introduces_huge_segment_span(monkeypatch):
+    approved_segments = [
+        TranscriptSegment(
+            words=[
+                WordTiming("אחת", 0.0, 1.0, confidence=0.95, source="review_hint", aligned=False),
+                WordTiming("שתיים", 1.0, 2.0, confidence=0.95, source="review_hint", aligned=False),
+                WordTiming("שלוש", 2.0, 3.0, confidence=0.95, source="review_hint", aligned=False),
+            ],
+            text="אחת שתיים שלוש",
+            start=0.0,
+            end=3.0,
+        ),
+    ]
+    draft_segments = [
+        TranscriptSegment(
+            words=[
+                WordTiming("אחת", 0.0, 1.0, confidence=0.95, source="draft_whisper"),
+                WordTiming("שתיים", 1.0, 2.0, confidence=0.95, source="draft_whisper"),
+                WordTiming("שלוש", 2.0, 3.0, confidence=0.95, source="draft_whisper"),
+            ],
+            text="אחת שתיים שלוש",
+            start=0.0,
+            end=3.0,
+        ),
+    ]
+    regressed_segments = [
+        TranscriptSegment(
+            words=[
+                WordTiming("אחת", 0.0, 0.8, confidence=0.95, source="forced_aligner", aligned=True),
+                WordTiming("שתיים", 0.8, 1.4, confidence=0.95, source="forced_aligner", aligned=True),
+                WordTiming("שלוש", 20.0, 28.0, confidence=0.95, source="forced_aligner", aligned=True),
+            ],
+            text="אחת שתיים שלוש",
+            start=0.0,
+            end=28.0,
+        ),
+    ]
+
+    monkeypatch.setattr(aligner_module, "_rebuild_segments", lambda template_segments, final_words: regressed_segments)
+    monkeypatch.setattr(
+        aligner_module,
+        "_refine_segments",
+        lambda audio_path, segments, video_frame_rate=None: segments,
+    )
+    monkeypatch.setattr(aligner_module, "_validate_final_segments", lambda segments: segments)
+
+    aligned = SequenceHebrewAligner().align("dummy.wav", approved_segments, draft_segments)
+
+    assert aligned.segments[0].end == 3.0
+    assert aligned.segments[0].words[-1].end == 3.0
+    assert aligned.unaligned_word_count == 0

@@ -61,10 +61,48 @@ def test_ass_renderer_highlights_graphemes_with_bold_second_layer(tmp_path):
     assert f"\\1c{style.secondary_color}" in ass_text
     assert "\\clip(" in ass_text
     assert "\\fad(" in ass_text
+    assert "\\t(" in ass_text
     assert re.search(r"\\pos\((\d+),(\d+)\)", base_line).groups() == re.search(
         r"\\pos\((\d+),(\d+)\)",
         active_line,
     ).groups()
+
+
+def test_ass_renderer_keeps_completed_graphemes_on_the_blue_layer(tmp_path):
+    ass_path = tmp_path / "karaoke.ass"
+    style = get_style()
+    segment = TranscriptSegment(
+        words=[
+            WordTiming(
+                "go",
+                0.0,
+                0.4,
+                subwords=[SubWordTiming("go", 0.0, 0.4)],
+            ),
+            WordTiming(
+                "now",
+                0.6,
+                1.0,
+                subwords=[SubWordTiming("now", 0.6, 1.0)],
+            ),
+        ],
+        text="go now",
+        start=0.0,
+        end=1.0,
+    )
+
+    AssKaraokeRenderer().render([segment], str(ass_path), style=style)
+
+    ass_text = ass_path.read_text(encoding="utf-8-sig")
+    persistent_lines = [
+        line
+        for line in ass_text.splitlines()
+        if line.startswith("Dialogue: 1,0:00:00.20,0:00:01.00")
+    ]
+
+    assert persistent_lines
+    assert all(f"\\1c{style.secondary_color}" in line for line in persistent_lines)
+    assert any("\\fad(" not in line for line in persistent_lines)
 
 
 def test_ass_renderer_trims_micro_overlap_from_base_layer(tmp_path):

@@ -11,6 +11,7 @@ from .models import (
     KaraokeStyle,
     LanguageDetectionResult,
     LyricsVerificationResult,
+    SingerAnalysisResult,
     TranscriptDraft,
     TranscriptSegment,
 )
@@ -68,12 +69,23 @@ class MultiStepLyricsVerifierProtocol(Protocol):
 class SubtitleRenderer(Protocol):
     name: str
 
-    def render(self, segments: list[TranscriptSegment], output_path: str, style: KaraokeStyle | None = None):
+    def render(
+        self,
+        segments: list[TranscriptSegment],
+        output_path: str,
+        style: KaraokeStyle | None = None,
+        singer_analysis: SingerAnalysisResult | None = None,
+    ):
         ...
 
 
 class SubtitleValidator(Protocol):
     name: str
 
-    def validate(self, segments: list[TranscriptSegment], style: KaraokeStyle) -> list[str]:
+    def validate(
+        self,
+        segments: list[TranscriptSegment],
+        style: KaraokeStyle,
+        singer_analysis: SingerAnalysisResult | None = None,
+    ) -> list[str]:
         ...

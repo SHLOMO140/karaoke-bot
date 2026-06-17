@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 from .exceptions import SubtitleGenerationError
-from .models import KaraokeStyle, TranscriptSegment
-from .subtitle_generator import _assign_ass_stack_offsets, _build_render_chunks, _enforce_segment_boundaries, _segment_line_count
+from .models import KaraokeStyle, SingerAnalysisResult, TranscriptSegment
+from .subtitle_generator import (
+    _assign_ass_stack_offsets,
+    _build_render_chunks,
+    _enforce_segment_boundaries,
+    _segment_line_count,
+    _singer_style_map,
+)
 
 
 class AssSubtitleGuardian:
@@ -12,9 +18,24 @@ class AssSubtitleGuardian:
 
     name = "ass_subtitle_guardian"
 
-    def validate(self, segments: list[TranscriptSegment], style: KaraokeStyle) -> list[str]:
-        render_chunks = _build_render_chunks(_enforce_segment_boundaries(segments), style)
-        stack_offsets = _assign_ass_stack_offsets(render_chunks, style)
+    def validate(
+        self,
+        segments: list[TranscriptSegment],
+        style: KaraokeStyle,
+        singer_analysis: SingerAnalysisResult | None = None,
+    ) -> list[str]:
+        render_chunks = _build_render_chunks(
+            _enforce_segment_boundaries(segments),
+            style,
+            singer_analysis=singer_analysis,
+            include_next_line_preview=True,
+        )
+        singer_styles = _singer_style_map(style, singer_analysis)
+        stack_offsets = _assign_ass_stack_offsets(
+            render_chunks,
+            style,
+            singer_styles=singer_styles if singer_styles else None,
+        )
         warnings: list[str] = []
 
         for index, chunk in enumerate(render_chunks):
@@ -40,6 +61,8 @@ class AssSubtitleGuardian:
                 other_line_count = _segment_line_count(other, style)
                 other_stack_start = stack_offsets.get(other_index, 0)
                 other_stack_end = other_stack_start + other_line_count
+                if singer_styles and getattr(chunk, "singer_id", "") != getattr(other, "singer_id", ""):
+                    continue
                 stack_ranges_overlap = not (
                     stack_end <= other_stack_start or other_stack_end <= stack_start
                 )

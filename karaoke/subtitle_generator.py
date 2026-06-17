@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import logging
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from statistics import median
 
 from .exceptions import SubtitleGenerationError
 from .harmony import build_word_id_chord_map
-from .models import KaraokeStyle, SongAnalysis, SubWordTiming, TranscriptSegment, WordTiming
+from .models import KaraokeStyle, SingerAnalysisResult, SongAnalysis, SubWordTiming, TranscriptSegment, WordTiming
 from .styles import get_style
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ POP_DIRECTIONAL = "\u202C"
 WINDOWS_FONT_DIR = Path("C:/Windows/Fonts")
 MICRO_OVERLAP_TOLERANCE_SEC = 0.06
 SUBWORD_TIMING_TOLERANCE_SEC = 0.08
+MAX_NEXT_LINE_PREVIEW_GAP_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,8 @@ class RenderChunk:
     source_segment_index: int = 0
     content_start: float = 0.0
     content_end: float = 0.0
+    singer_id: str = ""
+    line_singer_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,15 @@ class ChunkLayout:
     line_left: float
     line_right: float
     placed_words: list[tuple[WordTiming, float, float, float]]
+
+
+@dataclass(frozen=True)
+class ResolvedLine:
+    words: list[WordTiming]
+    start: float
+    end: float
+    source_segment_index: int = 0
+    singer_id: str = ""
 
 
 def _format_srt_time(seconds: float) -> str:
@@ -146,7 +158,7 @@ def _line_partition_cost(words: list[WordTiming], style: KaraokeStyle) -> float:
     char_fill = min(_line_length(words) / max_chars, 1.0)
     cost = ((1.0 - char_fill) ** 2) * 1.35 + ((1.0 - word_fill) ** 2) * 0.9
     if len(words) == 1:
-        cost += 0.35
+        cost += 0.9
     return cost
 
 
@@ -253,6 +265,10 @@ def _rebalance_single_word_lines(lines: list[list[WordTiming]], style: KaraokeSt
         total = _line_partition_cost(current, style)
         if next_line:
             total += _line_partition_cost(next_line, style)
+        if len(current) == 1 and next_line:
+            total += 0.45
+        if len(next_line) == 1 and current:
+            total += 0.45
         return total
 
     improved = True
@@ -531,59 +547,133 @@ def _segment_word_bounds(segment: TranscriptSegment) -> tuple[float, float]:
 
 
 def _close_intra_line_gaps(line_words: list[WordTiming]) -> list[WordTiming]:
-    """Close gaps between consecutive words within a line.
+    """Preserve natural gaps between words.
 
-    When a word ends before the next word starts (intra-line gap), extend the
-    previous word's end to meet the next word's start.  This prevents "broken"
-    lines where the karaoke highlight jumps or freezes between words.
+    Previously this function extended each word's end to fill the gap before the
+    next word, which made the karaoke highlight jump to the next word immediately
+    instead of waiting until the singer actually starts it.  Now we keep the
+    original word boundaries so the grapheme highlight only covers the time the
+    word is actually sung.
     """
-    if len(line_words) <= 1:
-        return line_words
-    fixed = list(line_words)
-    for i in range(len(fixed) - 1):
-        gap = fixed[i + 1].start - fixed[i].end
-        if gap > 1e-3 and gap < 0.30:
-            # Small gap — extend previous word to fill it
-            fixed[i] = WordTiming(
-                word=fixed[i].word,
-                start=fixed[i].start,
-                end=fixed[i + 1].start,
-                confidence=fixed[i].confidence,
-                source=fixed[i].source,
-                aligned=fixed[i].aligned,
-                subwords=fixed[i].subwords,
-            )
-    return fixed
+    return line_words
 
 
-def _build_render_chunks(segments: list[TranscriptSegment], style: KaraokeStyle) -> list[RenderChunk]:
-    # Small lead-in before the first word starts being highlighted, so the
-    # text is visible on screen for a moment before the karaoke effect begins.
-    LEAD_IN_SEC = 0.12
+def _singer_assignment_map(singer_analysis: SingerAnalysisResult | None) -> dict[int, str]:
+    if singer_analysis is None:
+        return {}
+    return {
+        assignment.segment_index: assignment.singer_id
+        for assignment in singer_analysis.assignments
+        if assignment.singer_id
+    }
 
-    chunks: list[RenderChunk] = []
+
+def _singer_style_map(style: KaraokeStyle, singer_analysis: SingerAnalysisResult | None) -> dict[str, KaraokeStyle]:
+    if singer_analysis is None or singer_analysis.detected_singer_count <= 1 or not singer_analysis.profiles:
+        return {}
+
+    lane_indices = sorted({max(0, profile.lane_index) for profile in singer_analysis.profiles})
+    lane_count = max(1, len(lane_indices))
+    lane_offsets = {
+        2: [int(round(style.font_size * 1.55)), 0],
+        3: [int(round(style.font_size * 2.30)), int(round(style.font_size * 1.15)), 0],
+    }.get(min(3, lane_count), [0])
+    lane_index_to_offset = {
+        lane_index: lane_offsets[min(position, len(lane_offsets) - 1)]
+        for position, lane_index in enumerate(lane_indices)
+    }
+
+    resolved: dict[str, KaraokeStyle] = {}
+    for profile in singer_analysis.profiles:
+        lane_offset = lane_index_to_offset.get(profile.lane_index, lane_offsets[-1] if lane_offsets else 0)
+        resolved[profile.singer_id] = replace(
+            style,
+            primary_color=profile.primary_color or style.primary_color,
+            secondary_color=profile.secondary_color or style.secondary_color,
+            outline_color=profile.outline_color or style.outline_color,
+            shadow_color=profile.shadow_color or style.shadow_color,
+            margin_v=style.margin_v + lane_offset,
+        )
+    return resolved
+
+
+def _resolve_render_lines(
+    segments: list[TranscriptSegment],
+    style: KaraokeStyle,
+    singer_analysis: SingerAnalysisResult | None = None,
+) -> list[ResolvedLine]:
+    lines: list[ResolvedLine] = []
+    assignment_map = _singer_assignment_map(singer_analysis)
     for segment_index, segment in enumerate(segments):
-        for line_index, line_words in enumerate(_split_segment_words(segment, style)):
+        singer_id = assignment_map.get(segment_index, "")
+        for line_words in _split_segment_words(segment, style):
             if not line_words:
                 continue
-            # Close intra-line gaps so words flow continuously without breaks
             line_words = _close_intra_line_gaps(line_words)
             content_start = line_words[0].start
             content_end = min(segment.end, line_words[-1].end)
-            # Display the text slightly before the first word is highlighted.
-            chunk_start = max(segment.start, content_start - LEAD_IN_SEC) if line_index == 0 else content_start
-            chunk_end = max(content_start + 0.01, content_end)
-            chunks.append(
-                RenderChunk(
-                    lines=[line_words],
+            lines.append(
+                ResolvedLine(
                     words=line_words,
-                    start=chunk_start,
-                    end=chunk_end,
+                    start=content_start,
+                    end=max(content_start + 0.01, content_end),
                     source_segment_index=segment_index,
-                    content_start=content_start,
-                    content_end=max(content_start + 0.01, content_end),
+                    singer_id=singer_id,
                 )
             )
+
+    lines.sort(key=lambda line: (line.start, line.end, line.source_segment_index))
+    return lines
+
+
+def _find_next_preview_line(
+    lines: list[ResolvedLine],
+    index: int,
+    max_gap_seconds: float = MAX_NEXT_LINE_PREVIEW_GAP_SECONDS,
+) -> ResolvedLine | None:
+    current = lines[index]
+    for candidate in lines[index + 1 :]:
+        if candidate.start <= current.start + 1e-3:
+            continue
+        if candidate.start < current.end - MICRO_OVERLAP_TOLERANCE_SEC:
+            continue
+        if candidate.start - current.end > max_gap_seconds:
+            break
+        return candidate
+    return None
+
+
+def _build_render_chunks(
+    segments: list[TranscriptSegment],
+    style: KaraokeStyle,
+    singer_analysis: SingerAnalysisResult | None = None,
+    include_next_line_preview: bool = False,
+) -> list[RenderChunk]:
+    chunks: list[RenderChunk] = []
+    resolved_lines = _resolve_render_lines(segments, style, singer_analysis=singer_analysis)
+    for index, line in enumerate(resolved_lines):
+        display_lines = [line.words]
+        line_singer_ids = [line.singer_id]
+        preview_line = _find_next_preview_line(resolved_lines, index) if include_next_line_preview else None
+        chunk_end = line.end
+        if preview_line is not None:
+            display_lines.append(preview_line.words)
+            line_singer_ids.append(preview_line.singer_id)
+            chunk_end = max(chunk_end, preview_line.start)
+
+        chunks.append(
+            RenderChunk(
+                lines=display_lines,
+                line_singer_ids=line_singer_ids,
+                words=line.words,
+                start=line.start,
+                end=max(line.start + 0.01, chunk_end),
+                source_segment_index=line.source_segment_index,
+                content_start=line.start,
+                content_end=line.end,
+                singer_id=line.singer_id,
+            )
+        )
 
     chunks.sort(key=lambda chunk: (chunk.start, chunk.end, chunk.source_segment_index))
 
@@ -595,7 +685,11 @@ def _build_render_chunks(segments: list[TranscriptSegment], style: KaraokeStyle)
             chunk_text = " ".join(w.word for w in chunk.words)
             prev_text = " ".join(w.word for w in prev.words)
             # Same text and times overlap or are within 100ms — duplicate
-            if chunk_text == prev_text and chunk.start < prev.end + 0.10:
+            if (
+                chunk_text == prev_text
+                and chunk.singer_id == prev.singer_id
+                and chunk.start < prev.end + 0.10
+            ):
                 # Keep the one that starts earlier (already in deduped)
                 logger.debug("Removed duplicate chunk: '%s' at %.3f", chunk_text[:30], chunk.start)
                 continue
@@ -607,7 +701,7 @@ def _build_render_chunks(segments: list[TranscriptSegment], style: KaraokeStyle)
     for index in range(len(chunks) - 1):
         current = chunks[index]
         next_chunk = chunks[index + 1]
-        if current.end > next_chunk.start + 1e-6:
+        if current.singer_id == next_chunk.singer_id and current.end > next_chunk.start + 1e-6:
             trimmed_end = next_chunk.start
             chunks[index] = replace(current, end=max(current.start + 0.01, trimmed_end))
 
@@ -615,8 +709,12 @@ def _build_render_chunks(segments: list[TranscriptSegment], style: KaraokeStyle)
     return [chunk for chunk in chunks if chunk.end > chunk.start + 1e-3]
 
 
-def _assign_ass_stack_offsets(segments: list[TranscriptSegment], style: KaraokeStyle) -> dict[int, int]:
-    active: list[tuple[float, int, int]] = []
+def _assign_ass_stack_offsets(
+    segments: list[TranscriptSegment],
+    style: KaraokeStyle,
+    singer_styles: dict[str, KaraokeStyle] | None = None,
+) -> dict[int, int]:
+    active_by_lane: dict[str, list[tuple[float, int, int]]] = {}
     offsets: dict[int, int] = {}
 
     indexed_segments = sorted(enumerate(segments), key=lambda item: (item[1].start, item[1].end, item[0]))
@@ -625,6 +723,8 @@ def _assign_ass_stack_offsets(segments: list[TranscriptSegment], style: KaraokeS
             offsets[segment_index] = 0
             continue
 
+        lane_key = getattr(segment, "singer_id", "") if singer_styles else ""
+        active = active_by_lane.setdefault(lane_key, [])
         active = [item for item in active if item[0] > segment.start + 1e-6]
         units = _segment_line_count(segment, style)
         slot = 0
@@ -640,6 +740,7 @@ def _assign_ass_stack_offsets(segments: list[TranscriptSegment], style: KaraokeS
         offsets[segment_index] = slot
         active.append((segment.end, slot, units))
         active.sort(key=lambda item: item[0])
+        active_by_lane[lane_key] = active
 
     return offsets
 
@@ -648,6 +749,10 @@ def _style_event_tags(style: KaraokeStyle, fill_color: str | None = None) -> str
     tags: list[str] = []
     if fill_color:
         tags.append(f"\\1c{fill_color}")
+    if style.outline_color:
+        tags.append(f"\\3c{style.outline_color}")
+    if style.shadow_color:
+        tags.append(f"\\4c{style.shadow_color}")
     if style.blur > 0:
         tags.append(f"\\blur{style.blur:g}")
     return "".join(tags)
@@ -928,9 +1033,14 @@ def _build_hud_events(song_analysis: SongAnalysis | None, style: KaraokeStyle) -
             last_time = beat_times[-1] + 2.0
 
         if last_time > first_time:
-            bpm_text = f"BPM: {bpm:.0f}" if bpm > 0 else "BPM: --"
-            meter_text = f"{time_sig}/4"
-            hud_text = f"{bpm_text}  |  {meter_text}"
+            bpm_text = f"קצב: {bpm:.0f}" if bpm > 0 else "קצב: --"
+            meter_text = f"משקל: {time_sig}/4"
+            hud_parts = [bpm_text, meter_text]
+            if song_analysis.original_key:
+                hud_parts.append(f"סולם מקור: {song_analysis.original_key}")
+            if song_analysis.target_key:
+                hud_parts.append(f"סולם קל: {song_analysis.target_key}")
+            hud_text = "  |  ".join(hud_parts)
             ass_start, ass_end = _format_ass_interval(first_time, last_time)
             dialogue_lines.append(
                 f"Dialogue: 10,{ass_start},{ass_end},HUD,,0,0,0,,"
@@ -1104,6 +1214,28 @@ def _base_line_event(
     )
 
 
+def _preview_line_event(
+    event_start: float,
+    event_end: float,
+    layout: ChunkLayout,
+    style: KaraokeStyle,
+    alpha: str = "78",
+) -> str:
+    extra_tags = _style_event_tags(style, fill_color=style.primary_color)
+    start, end = _format_ass_interval(event_start, event_end)
+    return (
+        "Dialogue: 0,{start},{end},Karaoke,,0,0,0,,{{\\an6\\q2\\pos({x},{y})\\1a&H{alpha}&{extra}}}{text}".format(
+            start=start,
+            end=end,
+            x=int(round(layout.anchor_x)),
+            y=int(round(layout.y)),
+            alpha=alpha,
+            extra=extra_tags,
+            text=layout.ass_text,
+        )
+    )
+
+
 def _build_reveal_widths(word: WordTiming, word_width: float, style: KaraokeStyle) -> list[float]:
     subwords = _subwords_for_word(word)
     if not subwords:
@@ -1228,9 +1360,9 @@ def _active_grapheme_events(
             continue
 
         total_ms = max(1, int(round((grapheme_end - grapheme.start) * 1000)))
-        fade_in_ms = min(18, max(0, total_ms // 4))
-        fade_out_ms = min(style.grapheme_fade_ms, max(1, total_ms - fade_in_ms - 1))
-        fade_tag = f"\\fad({fade_in_ms},{fade_out_ms})" if fade_in_ms or fade_out_ms else ""
+        # No fade-in so the highlight appears exactly on time.
+        fade_out_ms = min(20, max(0, total_ms - 1))
+        fade_tag = f"\\fad(0,{fade_out_ms})" if fade_out_ms else ""
         start, end = _format_ass_interval(grapheme.start, grapheme_end)
         clip_left = max(left - clip_pad_x, int(round(grapheme_x - grapheme_width / 2)) - clip_pad_x)
         clip_right = min(right + clip_pad_x, int(round(grapheme_x + grapheme_width / 2)) + clip_pad_x)
@@ -1259,13 +1391,15 @@ def _active_chunk_grapheme_events(
     style: KaraokeStyle,
     max_end: float | None = None,
 ) -> list[str]:
-    dialogue_lines = []
-    extra_tags = _style_event_tags(style, fill_color=style.secondary_color)
     clip_pad_x, clip_pad_y = _grapheme_clip_padding(style)
     left = int(round(layout.line_left)) - clip_pad_x
     right = int(round(layout.line_right)) + clip_pad_x
     top = int(round(layout.y - style.font_size)) - clip_pad_y
     bottom = int(round(layout.y + style.font_size * 0.6)) + clip_pad_y
+    sweep_pad_x = max(4, int(round(style.outline_width * 0.8 + style.blur * 2)))
+    dialogue_lines = []
+    extra_tags = _style_event_tags(style, fill_color=style.secondary_color)
+    previous_clip_left = right
 
     for word, x, _y, width in layout.placed_words:
         for grapheme, grapheme_x, grapheme_width in _grapheme_positions(word, x, layout.y, width, style):
@@ -1274,24 +1408,77 @@ def _active_chunk_grapheme_events(
                 continue
 
             total_ms = max(1, int(round((grapheme_end - grapheme.start) * 1000)))
-            fade_in_ms = min(18, max(0, total_ms // 4))
-            fade_out_ms = min(style.grapheme_fade_ms, max(1, total_ms - fade_in_ms - 1))
-            fade_tag = f"\\fad({fade_in_ms},{fade_out_ms})" if fade_in_ms or fade_out_ms else ""
+            # Animate the reveal boundary so the blue layer glides across
+            # the line instead of blinking letter-sized clips on and off.
+            fade_out_ms = min(max(18, style.grapheme_fade_ms // 2), max(0, total_ms - 1))
+            fade_tag = f"\\fad(0,{fade_out_ms})" if fade_out_ms else ""
             start, end = _format_ass_interval(grapheme.start, grapheme_end)
-            clip_left = max(left, int(round(grapheme_x - grapheme_width / 2)) - clip_pad_x)
-            clip_right = min(right, int(round(grapheme_x + grapheme_width / 2)) + clip_pad_x)
+            clip_left = max(left, int(round(grapheme_x - grapheme_width / 2)) - sweep_pad_x)
+            clip_left = min(previous_clip_left, clip_left)
+            transform = ""
+            if clip_left != previous_clip_left:
+                transform = f"\\t(0,{total_ms},\\clip({clip_left},{top},{right},{bottom}))"
             dialogue_lines.append(
-                "Dialogue: 1,{start},{end},Karaoke,,0,0,0,,{{\\an6\\q2\\pos({x},{y})\\1a&H{alpha}&\\clip({clip_left},{top},{clip_right},{bottom}){fade}{extra}}}{text}".format(
+                "Dialogue: 1,{start},{end},Karaoke,,0,0,0,,{{\\an6\\q2\\pos({x},{y})\\1a&H{alpha}&\\clip({clip_left},{top},{right},{bottom}){transform}{fade}{extra}}}{text}".format(
                     start=start,
                     end=end,
                     x=int(round(layout.anchor_x)),
                     y=int(round(layout.y)),
                     alpha=style.active_fill_alpha,
-                    clip_left=clip_left,
+                    clip_left=previous_clip_left,
                     top=top,
-                    clip_right=clip_right,
+                    right=right,
                     bottom=bottom,
+                    transform=transform,
                     fade=fade_tag,
+                    extra=extra_tags,
+                    text=layout.ass_text,
+                )
+            )
+            previous_clip_left = clip_left
+
+    return dialogue_lines
+
+
+def _post_active_chunk_grapheme_events(
+    layout: ChunkLayout,
+    style: KaraokeStyle,
+    max_end: float | None = None,
+) -> list[str]:
+    """Keep graphemes lit after their active sweep has completed."""
+    clip_pad_x, clip_pad_y = _grapheme_clip_padding(style)
+    left = int(round(layout.line_left)) - clip_pad_x
+    right = int(round(layout.line_right)) + clip_pad_x
+    top = int(round(layout.y - style.font_size)) - clip_pad_y
+    bottom = int(round(layout.y + style.font_size * 0.6)) + clip_pad_y
+    post_end = max_end if max_end is not None else max((word.end for word, *_rest in layout.placed_words), default=0.0)
+    sweep_pad_x = max(4, int(round(style.outline_width * 0.8 + style.blur * 2)))
+    dialogue_lines = []
+    extra_tags = _style_event_tags(style, fill_color=style.secondary_color)
+    reveal_clip_left = right
+
+    for word, x, _y, width in layout.placed_words:
+        for grapheme, grapheme_x, grapheme_width in _grapheme_positions(word, x, layout.y, width, style):
+            grapheme_end = min(grapheme.end, post_end)
+            if grapheme_end >= post_end - 1e-3:
+                continue
+
+            reveal_clip_left = min(
+                reveal_clip_left,
+                max(left, int(round(grapheme_x - grapheme_width / 2)) - sweep_pad_x),
+            )
+            start, end = _format_ass_interval(grapheme_end, post_end)
+            dialogue_lines.append(
+                "Dialogue: 1,{start},{end},Karaoke,,0,0,0,,{{\\an6\\q2\\pos({x},{y})\\1a&H{alpha}&\\clip({clip_left},{top},{right},{bottom}){extra}}}{text}".format(
+                    start=start,
+                    end=end,
+                    x=int(round(layout.anchor_x)),
+                    y=int(round(layout.y)),
+                    alpha=style.active_fill_alpha,
+                    clip_left=reveal_clip_left,
+                    top=top,
+                    right=right,
+                    bottom=bottom,
                     extra=extra_tags,
                     text=layout.ass_text,
                 )
@@ -1486,19 +1673,31 @@ def _enforce_segment_boundaries(segments: list[TranscriptSegment]) -> list[Trans
     Word and subword timings within a clipped segment are also clamped to
     the new boundary so downstream renderers see consistent data.
     """
-    if len(segments) <= 1:
-        return segments
+    sanitized: list[TranscriptSegment] = []
+    for segment in segments:
+        if segment.end <= segment.start + 1e-3:
+            logger.debug(
+                "Skipping near-zero subtitle segment: '%s' start=%.3f end=%.3f",
+                segment.text[:30],
+                segment.start,
+                segment.end,
+            )
+            continue
+        sanitized.append(segment)
+
+    if len(sanitized) <= 1:
+        return sanitized
 
     # Remove duplicate segments (identical text and nearly identical timing)
-    deduped: list[TranscriptSegment] = [segments[0]]
-    for seg in segments[1:]:
+    deduped: list[TranscriptSegment] = [sanitized[0]]
+    for seg in sanitized[1:]:
         prev = deduped[-1]
         if seg.text == prev.text and abs(seg.start - prev.start) < 0.10:
             logger.debug("Removed duplicate segment: '%s' at %.3f", seg.text[:30], seg.start)
             continue
         deduped.append(seg)
     if not deduped:
-        return segments
+        return sanitized
 
     result = list(deduped)
     for i in range(len(result) - 1):
@@ -1519,11 +1718,22 @@ def _enforce_segment_boundaries(segments: list[TranscriptSegment]) -> list[Trans
 class SrtRenderer:
     name = "srt_renderer"
 
-    def render(self, segments: list[TranscriptSegment], output_path: str, style: KaraokeStyle | None = None):
+    def render(
+        self,
+        segments: list[TranscriptSegment],
+        output_path: str,
+        style: KaraokeStyle | None = None,
+        singer_analysis: SingerAnalysisResult | None = None,
+    ):
         resolved_style = style or get_style()
         try:
             segments = _enforce_segment_boundaries(segments)
-            render_chunks = _build_render_chunks(segments, resolved_style)
+            render_chunks = _build_render_chunks(
+                segments,
+                resolved_style,
+                singer_analysis=singer_analysis,
+                include_next_line_preview=False,
+            )
             lines = []
             for index, chunk in enumerate(render_chunks, 1):
                 lines.append(str(index))
@@ -1544,73 +1754,141 @@ class AssKaraokeRenderer:
         output_path: str,
         style: KaraokeStyle | None = None,
         song_analysis: SongAnalysis | None = None,
+        singer_analysis: SingerAnalysisResult | None = None,
+        include_chord_overlays: bool = True,
+        include_hud: bool = True,
+        include_next_line_preview: bool = True,
     ):
         resolved_style = style or get_style()
         try:
             segments = _enforce_segment_boundaries(segments)
-            render_chunks = _build_render_chunks(segments, resolved_style)
+            singer_styles = _singer_style_map(resolved_style, singer_analysis)
+            render_chunks = _build_render_chunks(
+                segments,
+                resolved_style,
+                singer_analysis=singer_analysis,
+                include_next_line_preview=include_next_line_preview,
+            )
             dialogue_lines = []
-            stack_offsets = _assign_ass_stack_offsets(render_chunks, resolved_style)
+            stack_offsets = _assign_ass_stack_offsets(
+                render_chunks,
+                resolved_style,
+                singer_styles=singer_styles if singer_styles else None,
+            )
             preview_window = song_analysis.preview_window_seconds if song_analysis else 0.6
-            word_chord_map = build_word_id_chord_map(segments, song_analysis.chord_events) if song_analysis else {}
+            word_chord_map = (
+                build_word_id_chord_map(segments, song_analysis.chord_events)
+                if include_chord_overlays and song_analysis
+                else {}
+            )
             for chunk_index, chunk in enumerate(render_chunks):
                 if not chunk.words:
                     continue
+                chunk_style = singer_styles.get(chunk.singer_id, resolved_style)
 
                 chunk_layouts = _layout_chunk_geometries(
                     chunk.lines,
-                    resolved_style,
+                    chunk_style,
                     stack_offset_units=stack_offsets.get(chunk_index, 0),
                 )
+                if not chunk_layouts:
+                    continue
+                active_layout = chunk_layouts[0]
+                preview_layouts = chunk_layouts[1:]
+                preview_singer_ids = chunk.line_singer_ids[1:] if chunk.line_singer_ids else []
+                active_end = max(chunk.start + 0.01, chunk.content_end)
 
-                if resolved_style.effect_mode == "grapheme_highlight":
-                    for chunk_layout in chunk_layouts:
-                        dialogue_lines.append(_base_line_event(chunk.start, chunk.end, chunk_layout, resolved_style))
-                        dialogue_lines.extend(_active_chunk_grapheme_events(chunk_layout, resolved_style, max_end=chunk.end))
+                if chunk_style.effect_mode == "grapheme_highlight":
+                    dialogue_lines.append(_base_line_event(chunk.start, active_end, active_layout, chunk_style))
+                    dialogue_lines.extend(
+                        _active_chunk_grapheme_events(active_layout, chunk_style, max_end=active_end)
+                    )
+                    dialogue_lines.extend(
+                        _post_active_chunk_grapheme_events(active_layout, chunk_style, max_end=active_end)
+                    )
+                    dialogue_lines.extend(
+                        _word_chord_events(
+                            active_layout,
+                            chunk.start,
+                            active_end,
+                            word_chord_map,
+                            chunk_style,
+                            preview_window,
+                        )
+                    )
+                    for preview_index, preview_layout in enumerate(preview_layouts):
+                        preview_singer_id = preview_singer_ids[preview_index] if preview_index < len(preview_singer_ids) else ""
+                        preview_style = singer_styles.get(preview_singer_id, chunk_style)
+                        dialogue_lines.append(_preview_line_event(chunk.start, chunk.end, preview_layout, preview_style))
                     continue
 
-                for chunk_layout in chunk_layouts:
-                    for word, x, y, width in chunk_layout.placed_words:
-                        if resolved_style.effect_mode == "erase":
-                            dialogue_lines.extend(
-                                _erase_word_events(
-                                    TranscriptSegment(words=chunk.words, start=chunk.start, end=chunk.end),
-                                    word,
-                                    x,
-                                    y,
-                                    width,
-                                    resolved_style,
-                                    segment_start=chunk.start,
-                                    max_end=chunk.end,
-                                )
+                for word, x, y, width in active_layout.placed_words:
+                    if chunk_style.effect_mode == "erase":
+                        dialogue_lines.extend(
+                            _erase_word_events(
+                                TranscriptSegment(words=chunk.words, start=chunk.start, end=active_end),
+                                word,
+                                x,
+                                y,
+                                width,
+                                chunk_style,
+                                segment_start=chunk.start,
+                                max_end=active_end,
                             )
-                            continue
-
-                        dialogue_lines.append(_base_word_event(chunk.start, chunk.end, word, x, y, resolved_style))
-                        dialogue_lines.extend(_active_word_events(word, x, y, width, resolved_style, max_end=chunk.end))
-                        post_event = _post_active_word_event(
-                            TranscriptSegment(words=chunk.words, start=chunk.start, end=chunk.end),
-                            word,
-                            x,
-                            y,
-                            resolved_style,
-                            max_end=chunk.end,
                         )
-                        if post_event:
-                            dialogue_lines.append(post_event)
+                        continue
 
-            dialogue_lines.extend(_build_hud_events(song_analysis, resolved_style))
+                    dialogue_lines.append(_base_word_event(chunk.start, active_end, word, x, y, chunk_style))
+                    dialogue_lines.extend(_active_word_events(word, x, y, width, chunk_style, max_end=active_end))
+                    post_event = _post_active_word_event(
+                        TranscriptSegment(words=chunk.words, start=chunk.start, end=active_end),
+                        word,
+                        x,
+                        y,
+                        chunk_style,
+                        max_end=active_end,
+                    )
+                    if post_event:
+                        dialogue_lines.append(post_event)
+                dialogue_lines.extend(
+                    _word_chord_events(
+                        active_layout,
+                        chunk.start,
+                        active_end,
+                        word_chord_map,
+                        chunk_style,
+                        preview_window,
+                    )
+                )
+
+                for preview_index, preview_layout in enumerate(preview_layouts):
+                    preview_singer_id = preview_singer_ids[preview_index] if preview_index < len(preview_singer_ids) else ""
+                    preview_style = singer_styles.get(preview_singer_id, chunk_style)
+                    dialogue_lines.append(_preview_line_event(chunk.start, chunk.end, preview_layout, preview_style))
+
+            if include_hud:
+                dialogue_lines.extend(_build_hud_events(song_analysis, resolved_style))
             content = _build_ass_header(resolved_style) + "\n".join(dialogue_lines) + "\n"
             Path(output_path).write_text(content, encoding="utf-8-sig")
         except Exception as exc:
             raise SubtitleGenerationError(str(exc), "יצירת קובץ ASS נכשלה.") from exc
 
 
-def generate_srt(segments: list[TranscriptSegment], output_path: str, style: KaraokeStyle | None = None):
-    SrtRenderer().render(segments, output_path, style=style)
+def generate_srt(
+    segments: list[TranscriptSegment],
+    output_path: str,
+    style: KaraokeStyle | None = None,
+    singer_analysis: SingerAnalysisResult | None = None,
+):
+    SrtRenderer().render(segments, output_path, style=style, singer_analysis=singer_analysis)
     logger.info("Generated SRT at %s", output_path)
 
 
-def generate_ass_karaoke(segments: list[TranscriptSegment], output_path: str, style: KaraokeStyle | None = None):
-    AssKaraokeRenderer().render(segments, output_path, style)
+def generate_ass_karaoke(
+    segments: list[TranscriptSegment],
+    output_path: str,
+    style: KaraokeStyle | None = None,
+    singer_analysis: SingerAnalysisResult | None = None,
+):
+    AssKaraokeRenderer().render(segments, output_path, style, singer_analysis=singer_analysis)
     logger.info("Generated ASS at %s", output_path)

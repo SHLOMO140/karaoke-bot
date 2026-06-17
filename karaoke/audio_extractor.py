@@ -7,7 +7,7 @@ import subprocess
 from fractions import Fraction
 from pathlib import Path
 
-from .config import FFPROBE_EXE, FFMPEG_EXE
+from .config import FFPROBE_EXE, FFMPEG_EXE, HIGH_QUALITY_MP3_BITRATE
 from .exceptions import AudioExtractionError
 
 logger = logging.getLogger(__name__)
@@ -66,10 +66,10 @@ def extract_audio_from_video(video_path: str, output_path: str):
         "-i",
         str(video_path),
         "-vn",
-        "-acodec",
+        "-c:a",
         "libmp3lame",
-        "-q:a",
-        "2",
+        "-b:a",
+        HIGH_QUALITY_MP3_BITRATE,
         str(output_path),
     ]
     logger.info("Extracting audio from %s", video_path)
@@ -81,19 +81,31 @@ def extract_audio_from_video(video_path: str, output_path: str):
         raise AudioExtractionError(f"Missing extracted audio at {output_path}")
 
 
-def transcode_to_mp3(input_path: str, output_path: str):
+def transcode_to_mp3(
+    input_path: str,
+    output_path: str,
+    *,
+    title: str = "",
+    artist: str = "",
+):
     cmd = [
         FFMPEG_EXE,
         "-y",
         "-i",
         str(input_path),
         "-vn",
-        "-acodec",
+        "-c:a",
         "libmp3lame",
-        "-q:a",
-        "2",
-        str(output_path),
+        "-b:a",
+        HIGH_QUALITY_MP3_BITRATE,
     ]
+    if title:
+        cmd.extend(["-metadata", f"title={title}"])
+    if artist:
+        cmd.extend(["-metadata", f"artist={artist}"])
+    cmd.extend([
+        str(output_path),
+    ])
     result = subprocess.run(cmd, capture_output=True, timeout=300)
     if result.returncode != 0:
         error_text = result.stderr.decode(errors="ignore")[-400:]
