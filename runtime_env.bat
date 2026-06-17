@@ -1,0 +1,31 @@
+@echo off
+
+set "PROJECT_DIR=%~dp0"
+if "%PROJECT_DIR:~-1%"=="\" set "PROJECT_DIR=%PROJECT_DIR:~0,-1%"
+
+set "VENV_DIR=%PROJECT_DIR%\.venv"
+set "CACHE_DIR=%PROJECT_DIR%\.cache"
+set "TMP_DIR=%CACHE_DIR%\tmp"
+
+if not exist "%CACHE_DIR%" mkdir "%CACHE_DIR%"
+if not exist "%TMP_DIR%" mkdir "%TMP_DIR%"
+if not exist "%CACHE_DIR%\pip" mkdir "%CACHE_DIR%\pip"
+if not exist "%CACHE_DIR%\huggingface" mkdir "%CACHE_DIR%\huggingface"
+if not exist "%CACHE_DIR%\transformers" mkdir "%CACHE_DIR%\transformers"
+if not exist "%CACHE_DIR%\torch" mkdir "%CACHE_DIR%\torch"
+if not exist "%CACHE_DIR%\matplotlib" mkdir "%CACHE_DIR%\matplotlib"
+if not exist "%CACHE_DIR%\pyannote" mkdir "%CACHE_DIR%\pyannote"
+if not exist "%CACHE_DIR%\demucs" mkdir "%CACHE_DIR%\demucs"
+
+set "TMP=%TMP_DIR%"
+set "TEMP=%TMP_DIR%"
+set "PIP_CACHE_DIR=%CACHE_DIR%\pip"
+set "XDG_CACHE_HOME=%CACHE_DIR%"
+set "HF_HOME=%CACHE_DIR%\huggingface"
+set "TRANSFORMERS_CACHE=%CACHE_DIR%\transformers"
+set "TORCH_HOME=%CACHE_DIR%\torch"
+set "MPLCONFIGDIR=%CACHE_DIR%\matplotlib"
+set "PYANNOTE_CACHE=%CACHE_DIR%\pyannote"
+set "DEMUCS_CACHE_DIR=%CACHE_DIR%\demucs"
+set "KARAOKE_AUTO_DELETE_JOB_AFTER_DELIVERY=0"
+set "PYTHONIOENCODING=utf-8"
