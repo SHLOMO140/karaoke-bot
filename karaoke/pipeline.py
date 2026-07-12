@@ -300,10 +300,10 @@ class KaraokePipeline:
             job_manager.save_singer_analysis(self.job, analysis)
         return analysis
 
-    def step_post_review(self, job: Job, original_draft: TranscriptDraft):
+    def step_post_review(self, job: Job, original_draft: TranscriptDraft, aligned_segments=None):
         """Run Steps 5-7 after human approval (char diff, LLM validate, timing fix)."""
         if hasattr(self.lyrics_verifier, 'post_review_steps'):
-            self.lyrics_verifier.post_review_steps(job, original_draft)
+            self.lyrics_verifier.post_review_steps(job, original_draft, aligned_segments)
 
     def can_realign_after_review(self) -> bool:
         return self.job.vocals_16k_path.exists() or self.job.vocals_path.exists()
@@ -396,6 +396,14 @@ class KaraokePipeline:
                     f"דיוק אותיות {int(float(quality_report['char_timing_ratio']) * 100)}%."
                 ),
             )
+        try:
+            self.step_post_review(
+                self.job,
+                TranscriptDraft(segments=draft_segments, provider=""),
+                aligned.segments,
+            )
+        except Exception as exc:
+            logger.warning("Post-review steps failed for %s: %s", self.job.job_id, exc)
         job_manager.save_final_transcript(self.job, aligned)
         analysis = self.step_analyze_music(aligned.segments)
         singer_analysis = self.step_analyze_singers(aligned.segments)

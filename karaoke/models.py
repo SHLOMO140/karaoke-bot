@@ -317,6 +317,7 @@ class JobManifest:
     providers: dict[str, str] = field(default_factory=dict)
     timing_provider: str = ""
     timing_quality: dict[str, object] = field(default_factory=dict)
+    post_review_diff: dict[str, object] = field(default_factory=dict)
     language_info: dict[str, object] = field(default_factory=dict)
     lyrics_verification: dict[str, object] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)

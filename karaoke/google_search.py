@@ -2,11 +2,20 @@
 
 import json
 import logging
+import urllib.error
 import urllib.request
 import urllib.parse
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+class GoogleSearchQuotaError(RuntimeError):
+    """Google Custom Search refused the request for quota/rate reasons.
+
+    Raised (instead of silently returning []) so callers can skip further
+    Google queries and jump straight to the web-search fallbacks.
+    """
 
 @dataclass
 class SearchResult:
@@ -47,6 +56,12 @@ class GoogleSearchProvider:
                 )
                 for item in data.get("items", [])
             ]
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 403):
+                logger.warning("Google search quota/rate limited: %s", e)
+                raise GoogleSearchQuotaError(str(e)) from e
+            logger.warning("Google search failed: %s", e)
+            return []
         except Exception as e:
             logger.warning("Google search failed: %s", e)
             return []

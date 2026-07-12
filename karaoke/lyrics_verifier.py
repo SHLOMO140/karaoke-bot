@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
 import logging
 import re
+import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from urllib.error import HTTPError
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+
+from .config import CONSENSUS_MODE, HTTP_CACHE_DIR, HTTP_CACHE_TTL_SECONDS, LLM_TIMEOUT_SECONDS
+from .consensus import normalize_lyrics_line
+from .google_search import GoogleSearchQuotaError
 
 from .models import (
     ConsensusResult,
@@ -34,6 +41,15 @@ SEARCH_HEADERS = {
     ),
     "Accept-Language": "he-IL,he;q=0.9,en;q=0.7",
 }
+# nagnu.co.il uses both spellings of "artists" in URL paths across the site.
+NAGNU_ARTIST_SEGMENTS = ("אמנים", "אומנים")
+
+# Latin tokens that are really chord labels (leaking from chords sites), e.g.
+# Am, F#m, Bb7, Gsus4, C/E — filtered out of mixed-language lyric lines.
+_CHORD_LABEL_TOKEN_RE = re.compile(
+    r"^[A-G][#b]?(?:maj7|m7b5|m7|m9|m|dim7?|aug|sus[24]|add\d+|6|7|9|11|13)?(?:/[A-G][#b]?)?$"
+)
+
 KNOWN_LYRICS_DOMAINS = (
     "shironet.mako.co.il",
     "nagnu.co.il",
@@ -417,12 +433,61 @@ def _encode_url(url: str) -> str:
     return urllib.parse.urlunparse(encoded)
 
 
-def _fetch_text(url: str, timeout: int = 12) -> str:
+def _fetch_text_uncached(url: str, timeout: int = 12) -> str:
     encoded_url = _encode_url(url)
     request = urllib.request.Request(encoded_url, headers=SEARCH_HEADERS)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="ignore")
+
+
+def _http_cache_path(url: str) -> Path:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+    return Path(HTTP_CACHE_DIR) / f"{digest}.html"
+
+
+def _is_cacheable_lyrics_url(url: str) -> bool:
+    domain = _domain_from_url(url)
+    return any(domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS)
+
+
+def _fetch_text(url: str, timeout: int = 12) -> str:
+    """Fetch a page with a one-shot retry and an on-disk cache for lyric pages.
+
+    Search-engine pages are never cached (results must stay fresh); pages on
+    known lyrics domains are cached for HTTP_CACHE_TTL_SECONDS so re-verifying
+    a song does not re-pay timeouts, 404s and bot blocks.
+    """
+    cache_path = _http_cache_path(url) if _is_cacheable_lyrics_url(url) else None
+    if cache_path is not None:
+        try:
+            if cache_path.exists() and time.time() - cache_path.stat().st_mtime < HTTP_CACHE_TTL_SECONDS:
+                return cache_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            pass
+
+    text = ""
+    for attempt in range(2):
+        try:
+            text = _fetch_text_uncached(url, timeout=timeout)
+            break
+        except HTTPError as exc:
+            # 404 is definitive; retrying will not help.
+            if exc.code == 404 or attempt == 1:
+                raise
+            time.sleep(1.0)
+        except Exception:
+            if attempt == 1:
+                raise
+            time.sleep(1.0)
+
+    if cache_path is not None and text and not _is_bot_blocked(text):
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+    return text
 
 
 def _decode_redirect(url: str) -> str:
@@ -602,11 +667,73 @@ def _line_sets_differ(left: list[str], right: list[str]) -> bool:
     return normalized_left != normalized_right
 
 
+def _token_stream_overlap(left_lines: list[str], right_lines: list[str]) -> float:
+    """Ordered token-overlap ratio between two blocks of lines (0..1)."""
+    left = [token for line in left_lines for token in normalize_lyrics_line(line).split() if token]
+    right = [token for line in right_lines for token in normalize_lyrics_line(line).split() if token]
+    if not left or not right:
+        return 0.0
+    matcher = SequenceMatcher(None, left, right, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / max(1, min(len(left), len(right)))
+
+
+def _consensus_matches_draft(lyrics_lines: list[str], draft_text: str, *, threshold: float = 0.35) -> bool:
+    """Sanity check that agreed source lyrics resemble the sung transcript.
+
+    Sources can confidently agree on the WRONG song (similar titles, covers);
+    if the token overlap with the Whisper draft is too low, consensus should
+    demote to LLM arbitration instead of auto-verifying.
+    """
+    return _token_stream_overlap(draft_text.splitlines(), lyrics_lines) >= threshold
+
+
+def _effective_llm_confidence(
+    llm_confidence: float,
+    lyrics_lines: list[str],
+    *,
+    sources: dict[str, list[str]] | None,
+    draft_text: str,
+) -> float:
+    """Cap the LLM's self-reported confidence with objective agreement.
+
+    A model may print CONFIDENCE: 0.95 while inventing lyrics; auto-apply must
+    depend on how well the answer matches the search sources (or, without
+    sources, at least resemble the sung transcript).
+    """
+    llm_confidence = max(0.0, min(1.0, float(llm_confidence or 0.0)))
+    if sources:
+        agreement = max(
+            (
+                _token_stream_overlap(lyrics_lines, source_lines)
+                for source_lines in sources.values()
+                if source_lines
+            ),
+            default=0.0,
+        )
+        return min(llm_confidence, 0.55 + 0.45 * agreement)
+
+    similarity = _token_stream_overlap(lyrics_lines, draft_text.splitlines())
+    if 0.35 <= similarity <= 0.95:
+        return llm_confidence
+    return min(llm_confidence, 0.75)
+
+
 def _estimate_line_corrections(draft: TranscriptDraft, corrected_lines: list[str]) -> int:
+    """Count corrected lines via opcode alignment.
+
+    Naive zip counting inflates the number whenever segmentation changes
+    (splitting one line used to count every following line as "corrected").
+    """
     draft_lines = _draft_lines(draft)
     corrected = [str(line).strip() for line in corrected_lines if str(line).strip()]
-    paired_differences = sum(1 for left, right in zip(draft_lines, corrected) if left != right)
-    return paired_differences + abs(len(draft_lines) - len(corrected))
+    matcher = SequenceMatcher(None, draft_lines, corrected, autojunk=False)
+    corrections = 0
+    for tag, a_start, a_end, b_start, b_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        corrections += max(a_end - a_start, b_end - b_start)
+    return corrections
 
 
 def _should_auto_apply_verified_lines(
@@ -981,7 +1108,7 @@ GEMINI_LYRICS_PROMPT = """\
 """
 
 
-def _call_gemini(prompt: str, api_key: str, model: str, timeout: int = 25) -> str:
+def _call_gemini(prompt: str, api_key: str, model: str, timeout: int = LLM_TIMEOUT_SECONDS) -> str:
     """Call Gemini REST API and return the generated text.
 
     Retries once on HTTP 429 (rate limit) after a short delay.
@@ -1015,17 +1142,24 @@ def _call_gemini(prompt: str, api_key: str, model: str, timeout: int = 25) -> st
             return parts[0].get("text", "") if parts else ""
         except HTTPError as exc:
             last_error = exc
-            if exc.code == 429 and attempt == 0:
-                logger.info("Gemini rate limited, retrying in 5 seconds...")
-                time.sleep(5)
+            if attempt == 0 and (exc.code == 429 or exc.code >= 500):
+                logger.info("Gemini HTTP %s, retrying...", exc.code)
+                time.sleep(5 if exc.code == 429 else 2)
                 continue
             raise
-        except Exception:
+        except Exception as exc:
+            # Timeouts and transient network failures deserve one more try —
+            # production logs showed deep-verify dying on a single timeout.
+            last_error = exc
+            if attempt == 0:
+                logger.info("Gemini call failed (%s), retrying once...", exc)
+                time.sleep(2)
+                continue
             raise
     raise last_error  # type: ignore[misc]
 
 
-def _call_grok(prompt: str, api_key: str, model: str, timeout: int = 25) -> str:
+def _call_grok(prompt: str, api_key: str, model: str, timeout: int = LLM_TIMEOUT_SECONDS) -> str:
     """Call xAI's OpenAI-compatible chat completions endpoint and return text."""
     import time
 
@@ -1076,17 +1210,22 @@ def _call_grok(prompt: str, api_key: str, model: str, timeout: int = 25) -> str:
             return str(content or "")
         except HTTPError as exc:
             last_error = exc
-            if exc.code == 429 and attempt == 0:
-                logger.info("Grok rate limited, retrying in 5 seconds...")
-                time.sleep(5)
+            if attempt == 0 and (exc.code == 429 or exc.code >= 500):
+                logger.info("Grok HTTP %s, retrying...", exc.code)
+                time.sleep(5 if exc.code == 429 else 2)
                 continue
             raise
-        except Exception:
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                logger.info("Grok call failed (%s), retrying once...", exc)
+                time.sleep(2)
+                continue
             raise
     raise last_error  # type: ignore[misc]
 
 
-def _call_lyrics_llm(prompt: str, provider: str, api_key: str, model: str, timeout: int = 25) -> str:
+def _call_lyrics_llm(prompt: str, provider: str, api_key: str, model: str, timeout: int = LLM_TIMEOUT_SECONDS) -> str:
     normalized = _normalize_lyrics_llm_provider(provider)
     if normalized == "grok":
         return _call_grok(prompt, api_key, model, timeout=timeout)
@@ -1382,6 +1521,9 @@ class MultiStepLyricsVerifier:
         *,
         provider_used: str | None = None,
     ) -> LyricsVerificationResult:
+        search_warnings = list(getattr(self, "_last_search_warnings", []) or [])
+        if search_warnings:
+            result.local_warnings = list(dict.fromkeys([*search_warnings, *result.local_warnings]))
         actual_provider = _normalize_lyrics_llm_provider(provider_used or self._llm_provider)
         result.llm_provider = actual_provider
         if actual_provider == "gemini":
@@ -1451,7 +1593,22 @@ class MultiStepLyricsVerifier:
             logger.warning("Source search failed: %s", exc)
             sources = {}
 
-        consensus = self._consensus.evaluate(sources)
+        if CONSENSUS_MODE == "positional":
+            consensus = self._consensus.evaluate(sources)
+        else:
+            consensus = self._consensus.evaluate_aligned(sources, priority=DOMAIN_PRIORITY)
+            if consensus.consensus_reached and not _consensus_matches_draft(consensus.lyrics, draft_text):
+                # Guard against confidently agreeing on the WRONG song: the
+                # sources may all describe another track with a similar title.
+                logger.warning(
+                    "Aligned consensus rejected: agreed lyrics are too dissimilar to the transcript."
+                )
+                consensus = ConsensusResult(
+                    consensus_reached=False,
+                    agreed_sources=consensus.agreed_sources,
+                    lyrics=consensus.lyrics,
+                    disputes=consensus.disputes,
+                )
         merged_search_lines, merged_search_sources = _merge_search_source_versions(sources)
 
         if consensus.consensus_reached and consensus.agreed_sources >= 3:
@@ -1502,6 +1659,9 @@ class MultiStepLyricsVerifier:
                 provider_used = self._last_llm_provider_used
                 fallback_warning = self._last_llm_warning
                 normalized_lyrics = [str(line).strip() for line in lyrics if str(line).strip()]
+                confidence = _effective_llm_confidence(
+                    confidence, normalized_lyrics, sources=None, draft_text=draft_text
+                )
                 correction_count = _estimate_line_corrections(draft, normalized_lyrics)
                 apply_corrections = _should_auto_apply_verified_lines(
                     draft,
@@ -1566,6 +1726,9 @@ class MultiStepLyricsVerifier:
             )
             provider_used = self._last_llm_provider_used
             fallback_warning = self._last_llm_warning
+            confidence = _effective_llm_confidence(
+                confidence, lyrics, sources=sources, draft_text=draft_text
+            )
             correction_count = _estimate_line_corrections(draft, lyrics)
             apply_corrections = _should_auto_apply_verified_lines(
                 draft,
@@ -1668,96 +1831,9 @@ class MultiStepLyricsVerifier:
                 source_versions=sources,
             ))
 
-    def _search_all_sources(self, title: str, draft_text: str) -> dict[str, list[str]]:
+    def _search_all_sources(self, title: str, draft_or_text) -> dict[str, list[str]]:
         """Search multiple sources in parallel and return source_name -> lyrics lines."""
-        import concurrent.futures
-
-        queries = _build_query_variants(title, draft_text)
-        sources: dict[str, list[str]] = {}
-
-        # Collect URLs from Google search
-        urls_by_domain: dict[str, str] = {}  # domain -> first URL
-        google_failed = False
-
-        for query in queries[:3]:
-            try:
-                results = self._google.search(query, num=10)
-                for result in results:
-                    domain = _domain_from_url(result.url)
-                    if domain in KNOWN_LYRICS_DOMAINS and domain not in urls_by_domain:
-                        urls_by_domain[domain] = result.url
-            except Exception as exc:
-                logger.warning("Google search failed for query '%s': %s", query, exc)
-                if "429" in str(exc):
-                    google_failed = True
-                    break
-
-        # Fallback to DuckDuckGo if Google returned 429
-        if google_failed or not urls_by_domain:
-            for query in queries[:3]:
-                try:
-                    results = _search_duckduckgo_results(query)
-                    for result in results:
-                        domain = _domain_from_url(result.url)
-                        if domain in KNOWN_LYRICS_DOMAINS and domain not in urls_by_domain:
-                            urls_by_domain[domain] = result.url
-                except Exception as exc:
-                    logger.warning("DuckDuckGo fallback failed: %s", exc)
-
-        # Fetch and parse lyrics from each URL in parallel
-        def _fetch_and_parse(domain: str, url: str) -> tuple[str, list[str]]:
-            try:
-                req = urllib.request.Request(url, headers=SEARCH_HEADERS)
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    html_body = resp.read().decode("utf-8", errors="replace")
-                # Try site-specific extraction first
-                specific = _extract_site_specific_lyrics(url, html_body)
-                if specific:
-                    text = _strip_html_preserving_lines(specific)
-                else:
-                    text = _strip_html_preserving_lines(html_body)
-                lines = [line.strip() for line in text.splitlines() if line.strip()]
-                # Filter to lines with Hebrew content
-                hebrew_lines = [
-                    line for line in lines
-                    if re.search(r"[\u0590-\u05FF]", line) and len(line) >= 2
-                ]
-                if hebrew_lines:
-                    return _domain_option_key(url), hebrew_lines
-            except Exception as exc:
-                logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
-            return _domain_option_key(url), []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(_fetch_and_parse, domain, url): domain
-                for domain, url in urls_by_domain.items()
-            }
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    key, lines = future.result()
-                    if lines:
-                        sources[key] = lines
-                except Exception as exc:
-                    logger.warning("Source fetch error: %s", exc)
-
-        # Also try YouTube descriptions
-        try:
-            yt_results = self._youtube.search(f"{title} מילים", max_results=3)
-            for yt_result in yt_results:
-                desc = yt_result.snippet
-                if desc and re.search(r"[\u0590-\u05FF]", desc):
-                    lines = [
-                        line.strip() for line in desc.splitlines()
-                        if line.strip() and re.search(r"[\u0590-\u05FF]", line) and len(line.strip()) >= 2
-                    ]
-                    if len(lines) >= 3:
-                        sources[f"youtube_{yt_result.title[:20]}"] = lines
-                        break  # Use first good YouTube result
-        except Exception as exc:
-            logger.warning("YouTube search failed: %s", exc)
-
-        return sources
+        return _search_all_sources_impl(self, title, draft_or_text)
 
     def _gemini_deep_verify(
         self,
@@ -1797,7 +1873,7 @@ class MultiStepLyricsVerifier:
             f"LYRICS:\n<המילים הנכונות, שורה לשורה>"
         )
 
-        response_text = self._run_llm_prompt(prompt, timeout=30)
+        response_text = self._run_llm_prompt(prompt, timeout=LLM_TIMEOUT_SECONDS)
         return self._parse_gemini_response(response_text)
 
     def _gemini_knowledge_verify(
@@ -1819,14 +1895,16 @@ class MultiStepLyricsVerifier:
             f"LYRICS:\n<המילים, שורה לשורה>"
         )
 
-        response_text = self._run_llm_prompt(prompt, timeout=30)
+        response_text = self._run_llm_prompt(prompt, timeout=LLM_TIMEOUT_SECONDS)
         lyrics, confidence, _ = self._parse_gemini_response(response_text)
         return lyrics, confidence
 
     @staticmethod
     def _parse_gemini_response(response_text: str) -> tuple[list[str], float, list[str]]:
         """Parse structured Gemini response into lyrics, confidence, uncertain words."""
-        confidence = 0.7
+        # A missing CONFIDENCE header must not look almost-confident: 0.5
+        # keeps it below every auto-apply threshold.
+        confidence = 0.5
         uncertain: list[str] = []
         lyrics_lines: list[str] = []
 
@@ -1857,9 +1935,84 @@ class MultiStepLyricsVerifier:
 
         return lyrics_lines, confidence, uncertain
 
-    def post_review_steps(self, job, original_draft):
-        """Placeholder for Steps 5-7, called from bot.py after user approval."""
-        pass
+    def post_review_steps(self, job, original_draft, aligned_segments=None):
+        """Spec steps 5-7 after human approval.
+
+        Step 5: character-level diff between the draft and the approved words,
+        recorded in the manifest for observability.
+        Step 6: sanity warning (optionally LLM-checked) for unusually large
+        manual edits.
+        Step 7: rebuild char timings for changed words that did not get a
+        precise wav2vec2 measurement, using the vocals audio when available.
+        """
+        from . import job_manager
+        from .aligner import realign_changed_words
+        from .char_diff import compute_char_diffs, format_diff_table
+
+        if aligned_segments is None:
+            return
+        draft_words = [
+            word.word for segment in original_draft.segments for word in segment.words
+        ]
+        final_words = [word for segment in aligned_segments for word in segment.words]
+        if not draft_words or not final_words:
+            return
+
+        draft_norm = [_normalize_token(word) for word in draft_words]
+        final_norm = [_normalize_token(word.word) for word in final_words]
+        changed: list[tuple[int, str, str]] = []
+        matcher = SequenceMatcher(None, draft_norm, final_norm, autojunk=False)
+        for tag, a_start, a_end, b_start, b_end in matcher.get_opcodes():
+            if tag != "replace":
+                continue
+            for offset in range(min(a_end - a_start, b_end - b_start)):
+                changed.append(
+                    (
+                        b_start + offset,
+                        draft_words[a_start + offset],
+                        final_words[b_start + offset].word,
+                    )
+                )
+
+        if not changed:
+            job.manifest.post_review_diff = {"changed_words": 0, "realigned_words": 0}
+            return
+
+        # Step 7: partial re-timing for words whose boundaries were not
+        # measured by wav2vec2 (edits often leave them interpolation-timed).
+        audio_path = str(job.vocals_16k_path) if job.vocals_16k_path.exists() else None
+        realigned = 0
+        for final_index, _original, _corrected in changed:
+            word = final_words[final_index]
+            if word.aligned and word.source == "whisperx":
+                continue
+            try:
+                char_timings = realign_changed_words(word, word.word, audio_path)
+            except Exception as exc:
+                logger.info("Partial realignment failed for '%s': %s", word.word, exc)
+                continue
+            if char_timings:
+                word.char_timings = char_timings
+                realigned += 1
+
+        # Step 5: persist the diff for observability.
+        diffs = compute_char_diffs(
+            [original for _index, original, _corrected in changed],
+            [corrected for _index, _original, corrected in changed],
+            [index for index, _original, _corrected in changed],
+        )
+        job.manifest.post_review_diff = {
+            "changed_words": len(changed),
+            "realigned_words": realigned,
+            "diff_table": format_diff_table(diffs)[:4000],
+        }
+
+        # Step 6: unusually large manual edits get a visible sanity warning.
+        if len(changed) >= 12:
+            job_manager.add_warning(
+                job,
+                f"בוצעו {len(changed)} שינויי מילים ביחס לתמלול — כדאי לוודא שהטקסט הסופי מדויק לפני השיתוף.",
+            )
 
 
 def _relax_search_queries(query: str) -> list[str]:
@@ -2044,7 +2197,12 @@ def _looks_like_noise_line(line: str) -> bool:
         normalized,
     ):
         return True
-    if re.search(r"https?://|www\.|[@#]|[A-Za-z]{8,}", line):
+    # URLs, handles and very long Latin runs are junk; ordinary English words
+    # (mixed-language lyrics) must survive, so the run threshold is high and
+    # '#' is only noise when it is not part of a chord label like F#m.
+    if re.search(r"https?://|www\.|@|[A-Za-z]{14,}", line):
+        return True
+    if "#" in re.sub(r"[A-G]#(?:m|maj7|m7|dim|sus[24]|add\d+|\d)?\b", "", line):
         return True
     return any(keyword in normalized for keyword in _PAGE_NOISE_KEYWORDS)
 
@@ -2137,12 +2295,22 @@ def _extract_candidate_lyrics_line_entries(
         hebrew_tokens = [token for token in tokens if re.search(r"[\u0590-\u05FF]", token)]
         if len(hebrew_tokens) < 2 or len(hebrew_tokens) > 14:
             continue
-        normalized_line = " ".join(hebrew_tokens)
+        # Mixed-language songs: keep non-Hebrew words too (they used to be
+        # dropped entirely). Only Latin tokens that look like chord labels
+        # leaking from chords sites are filtered out.
+        kept_tokens = [
+            token
+            for token in tokens
+            if re.search(r"[\u0590-\u05FF]", token) or not _CHORD_LABEL_TOKEN_RE.match(token)
+        ]
+        if len(kept_tokens) > 18:
+            continue
+        normalized_line = " ".join(kept_tokens)
         if draft_lines:
             similarity, overlap = _best_draft_line_stats(normalized_line, draft_lines)
             if similarity < 0.22 and overlap < 0.34:
                 continue
-        lines.append((normalized_line, hebrew_tokens))
+        lines.append((normalized_line, kept_tokens))
     return lines
 
 
@@ -2549,6 +2717,14 @@ def _canonicalize_lyrics_source_url(url: str) -> str:
     return urllib.parse.urlunparse((scheme, netloc, path, "", parsed.query, ""))
 
 
+def _url_404_fallbacks(url: str) -> list[str]:
+    """Alternate URLs to try when a canonicalized URL turns out to be a 404."""
+    alternates = []
+    if "tab4u.com" in url and "/lyrics/songs/" in url:
+        alternates.append(url.replace("/lyrics/songs/", "/tabs/songs/"))
+    return alternates
+
+
 def _search_result_title_from_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     segments = [segment for segment in urllib.parse.unquote(parsed.path).split("/") if segment]
@@ -2560,7 +2736,7 @@ def _search_result_title_from_url(url: str) -> str:
         slug = re.sub(r"^\d+_", "", slug)
         return slug.replace("_", " ").strip()
 
-    if parsed.netloc.lower().endswith("nagnu.co.il") and len(segments) >= 3 and segments[-3] == "אמנים":
+    if parsed.netloc.lower().endswith("nagnu.co.il") and len(segments) >= 3 and segments[-3] in NAGNU_ARTIST_SEGMENTS:
         artist = html.unescape(segments[-2]).replace("_", " ").strip()
         song = html.unescape(segments[-1]).replace("_", " ").strip()
         return f"{song} / {artist}".strip(" /")
@@ -2743,7 +2919,7 @@ def _load_nagnu_lyrics_urls() -> list[str]:
         for raw_url in re.findall(r"<loc>(.*?)</loc>", xml_text):
             candidate_url = _canonicalize_lyrics_source_url(html.unescape(raw_url))
             decoded_url = html.unescape(urllib.parse.unquote(candidate_url))
-            if "/אומנים/" not in decoded_url:
+            if not any(f"/{segment}/" in decoded_url for segment in NAGNU_ARTIST_SEGMENTS):
                 continue
             if any(marker in decoded_url for marker in ("/מורים_", "/פרשנות", "/איך_לנגן", "/אקורדים")):
                 continue
@@ -3046,6 +3222,10 @@ def _build_query_variants(title: str, draft_text: str) -> list[str]:
                 f"{hebrew_artist} {song} {hebrew_suffix}",
                 f"{song} {hebrew_artist} {hebrew_suffix}",
                 f"\"{hebrew_artist}\" \"{song}\" {hebrew_suffix}",
+                # Shironet is the most authoritative Hebrew source but is only
+                # reachable via search engines - keep it inside the first
+                # queries the providers actually run (queries[:5]).
+                f"site:shironet.mako.co.il {hebrew_artist} {song}",
             ]
         )
     if latin_artist and song:
@@ -3140,8 +3320,13 @@ def _find_best_source_line_window(
             return
         candidate_lines = [line for line, _tokens in candidate_entries]
         score = _score_window(candidate_entries)
+        # Near-ties go to the window whose length matches the sung draft,
+        # not to the longer one (verbose pages full of credits/chords used
+        # to beat the correct-but-short lyric block).
         if score > best_score or (
-            abs(score - best_score) <= 0.03 and len(candidate_lines) > len(best_lines)
+            abs(score - best_score) <= 0.03
+            and abs(len(candidate_lines) - target_line_count)
+            < abs(len(best_lines) - target_line_count)
         ):
             best_lines = candidate_lines
             best_score = score
@@ -3287,8 +3472,17 @@ def _merge_search_source_versions(
     if not normalized_sources:
         return [], []
 
+    def _domain_rank(source_name: str) -> int:
+        for domain, rank in DOMAIN_PRIORITY.items():
+            if source_name == domain or source_name.endswith(domain):
+                return rank
+        return 50
+
+    # Authoritative domains lead the merge; raw block length only breaks ties
+    # within the same priority tier (length used to dominate, biasing toward
+    # verbose pages).
     normalized_sources.sort(
-        key=lambda item: (_line_block_quality(item[1]), item[0]),
+        key=lambda item: (-_domain_rank(item[0]), _line_block_quality(item[1]), item[0]),
         reverse=True,
     )
 
@@ -3399,7 +3593,7 @@ def _extract_youtube_source_lines(
     return cleaned_lines, candidate_score
 
 
-def _multistep_search_all_sources_override(
+def _search_all_sources_impl(
     self,
     title: str,
     draft_or_text: TranscriptDraft | str,
@@ -3412,6 +3606,8 @@ def _multistep_search_all_sources_override(
     source_url = getattr(self, "_current_source_url", "")
     sources: dict[str, tuple[float, list[str]]] = {}
     urls_by_domain: dict[str, list[str]] = {}
+    search_warnings: list[str] = []
+    self._last_search_warnings = search_warnings
     google_failed = False
 
     def _remember_result(result) -> None:
@@ -3450,11 +3646,11 @@ def _multistep_search_all_sources_override(
             results = self._google.search(query, num=10)
             for result in results:
                 _remember_result(result)
+        except GoogleSearchQuotaError:
+            google_failed = True
+            break
         except Exception as exc:
             logger.warning("Google search failed for query '%s': %s", query, exc)
-            if "429" in str(exc):
-                google_failed = True
-                break
 
     if google_failed or len(urls_by_domain) < 2:
         for query in queries[:5]:
@@ -3472,8 +3668,27 @@ def _multistep_search_all_sources_override(
     def _fetch_and_parse(url: str) -> tuple[str, list[str], float]:
         source_key = _domain_option_key(url)
         try:
-            html_body = _fetch_text(url, timeout=15)
+            try:
+                html_body = _fetch_text(url, timeout=15)
+            except HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                # Canonicalization rewrites URLs blindly (tab4u tabs->lyrics);
+                # when the rewritten page does not exist, try the original form.
+                html_body = ""
+                for alternate_url in _url_404_fallbacks(url):
+                    try:
+                        html_body = _fetch_text(alternate_url, timeout=15)
+                        break
+                    except Exception:
+                        continue
+                if not html_body:
+                    raise
             if _is_bot_blocked(html_body):
+                if "shironet" in source_key:
+                    search_warnings.append(
+                        "שירונט חסם גישה אוטומטית, אז האימות רץ בלי המקור הזה."
+                    )
                 return source_key, [], 0.0
 
             specific = _extract_site_specific_lyrics(url, html_body)
@@ -3516,4 +3731,3 @@ def _multistep_search_all_sources_override(
 
 
 SOURCE_DISPLAY_NAMES.setdefault("youtube", "YouTube")
-MultiStepLyricsVerifier._search_all_sources = _multistep_search_all_sources_override

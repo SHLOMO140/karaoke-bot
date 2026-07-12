@@ -19,6 +19,11 @@ LOCAL_VENV_PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
 CACHE_DIR = Path(os.getenv("KARAOKE_CACHE_DIR", BASE_DIR / ".cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Fetched lyric pages are cached here (survives the daily workspace reset,
+# which only empties .cache/tmp).
+HTTP_CACHE_DIR = Path(os.getenv("KARAOKE_HTTP_CACHE_DIR", str(CACHE_DIR / "http")))
+HTTP_CACHE_TTL_SECONDS = int(os.getenv("KARAOKE_HTTP_CACHE_TTL_SECONDS", str(30 * 24 * 3600)))
+
 
 def _default_runtime_dir() -> Path:
     if BASE_DIR.drive:
@@ -225,6 +230,7 @@ LYRICS_LLM_PROVIDER = _load_config_value(
     "KARAOKE_LYRICS_LLM_PROVIDER",
     _load_config_value("LYRICS_LLM_PROVIDER", "gemini"),
 )
+LLM_TIMEOUT_SECONDS = max(10, _load_int_config("KARAOKE_LLM_TIMEOUT_SEC", 40))
 
 # Google Custom Search API
 GOOGLE_API_KEY: str = _load_google_api_key()
@@ -235,6 +241,9 @@ YOUTUBE_API_ENABLED: bool = bool(GOOGLE_API_KEY)
 
 # Consensus engine
 CONSENSUS_MIN_SOURCES: int = 3  # minimum sources for auto-verification
+# aligned: token-stream alignment to an anchor source (robust to line offsets);
+# positional: legacy raw line-index voting.
+CONSENSUS_MODE = os.getenv("KARAOKE_CONSENSUS_MODE", "aligned").strip().lower()
 
 # Verification loop
 MAX_REVIEW_ITERATIONS: int = 2  # max round-trips through steps 4-6
