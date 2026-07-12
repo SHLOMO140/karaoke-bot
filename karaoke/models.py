@@ -315,6 +315,8 @@ class JobManifest:
     pending_delivery: dict[str, object] = field(default_factory=dict)
     quality_feedback: list[dict[str, object]] = field(default_factory=list)
     providers: dict[str, str] = field(default_factory=dict)
+    timing_provider: str = ""
+    timing_quality: dict[str, object] = field(default_factory=dict)
     language_info: dict[str, object] = field(default_factory=dict)
     lyrics_verification: dict[str, object] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)

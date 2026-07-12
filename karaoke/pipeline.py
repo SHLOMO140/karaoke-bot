@@ -373,6 +373,15 @@ class KaraokePipeline:
         for timing_warning in validate_timing_quality(aligned.segments):
             add_warning(self.job, timing_warning)
         quality_report = analyze_alignment_quality(aligned.segments)
+        timing_provider = getattr(self.aligner, "last_provider_used", "") or self.aligner.name
+        self.job.manifest.timing_provider = timing_provider
+        self.job.manifest.timing_quality = {
+            "score": float(quality_report.get("score", 0.0)),
+            "aligned_ratio": float(quality_report.get("aligned_ratio", 0.0)),
+            "char_timing_ratio": float(quality_report.get("char_timing_ratio", 0.0)),
+            "critical": bool(quality_report.get("critical", False)),
+            "warning_count": int(quality_report.get("warning_count", 0)),
+        }
         if quality_report["critical"]:
             raise AlignmentError(
                 f"Take-one quality gate failed: {quality_report}",

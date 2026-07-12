@@ -11,8 +11,46 @@ from karaoke.models import (
 )
 from karaoke.exceptions import SubtitleGenerationError
 from karaoke.styles import get_style
-from karaoke.subtitle_generator import AssKaraokeRenderer, SrtRenderer, _build_render_chunks, _format_srt_time, _split_segment_words
+from karaoke.subtitle_generator import (
+    AssKaraokeRenderer,
+    SrtRenderer,
+    _build_render_chunks,
+    _format_ass_interval,
+    _format_srt_time,
+    _split_segment_words,
+)
 from karaoke.subtitle_guardian import AssSubtitleGuardian
+
+
+def _parse_ass_centiseconds(stamp: str) -> int:
+    hours, minutes, rest = stamp.split(":")
+    seconds, centis = rest.split(".")
+    return ((int(hours) * 60 + int(minutes)) * 60 + int(seconds)) * 100 + int(centis)
+
+
+def test_format_ass_interval_rounds_half_up_not_floor():
+    start, end = _format_ass_interval(1.004, 1.506)
+    assert start == "0:00:01.00"  # 1.004 rounds down
+    assert end == "0:00:01.51"  # 1.506 rounds up (old int() floored to 1.50)
+
+
+def test_format_ass_interval_enforces_min_duration():
+    start, end = _format_ass_interval(2.0, 2.001)
+    assert _parse_ass_centiseconds(end) == _parse_ass_centiseconds(start) + 1
+
+
+def test_format_ass_interval_adjacent_words_never_overlap():
+    boundaries = [0.0, 0.333, 0.6667, 1.004, 1.3333, 1.9995, 2.5049]
+    previous_end = 0
+    for interval_start, interval_end in zip(boundaries, boundaries[1:]):
+        start, end = _format_ass_interval(interval_start, interval_end)
+        start_cs = _parse_ass_centiseconds(start)
+        end_cs = _parse_ass_centiseconds(end)
+        assert end_cs > start_cs
+        assert start_cs >= previous_end - 1  # shared boundary may round to same centisecond
+        # rounding error is at most half a centisecond
+        assert abs(start_cs - interval_start * 100) <= 0.5 + 1e-9
+        previous_end = end_cs
 
 
 def _segments():

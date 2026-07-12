@@ -87,8 +87,10 @@ def _format_ass_centiseconds(total_centiseconds: int) -> str:
 
 
 def _format_ass_interval(start_seconds: float, end_seconds: float) -> tuple[str, str]:
-    start_centiseconds = max(0, int(start_seconds * 100))
-    end_centiseconds = max(start_centiseconds + 1, int(end_seconds * 100))
+    # Round half-up instead of flooring: int() truncation biased every
+    # boundary 0-10ms early, which is audible on fast karaoke sweeps.
+    start_centiseconds = max(0, int(start_seconds * 100 + 0.5))
+    end_centiseconds = max(start_centiseconds + 1, int(end_seconds * 100 + 0.5))
     return (
         _format_ass_centiseconds(start_centiseconds),
         _format_ass_centiseconds(end_centiseconds),

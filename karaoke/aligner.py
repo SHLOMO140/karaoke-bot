@@ -17,10 +17,16 @@ except Exception:
     regex_lib = None
 
 from .config import (
+    ALIGNED_BOUNDARY_CLAMP_MS,
     ALIGNMENT_BOUNDARY_SEARCH_MS,
+    ALIGNMENT_DEVICE,
     ALIGNMENT_MIN_WORD_DURATION_MS,
     ALIGNMENT_MODEL_NAME,
     ALIGNMENT_PROVIDER,
+    SNAP_SEGMENTS_TO_SILENCE,
+    TIMING_REFINE_MODE,
+    WHISPERX_SEGMENT_PADDING_SEC,
+    WHISPERX_SEGMENT_RETRY_PADDING_SEC,
 )
 from .exceptions import AlignmentError
 from .models import AlignedTranscript, CharacterTiming, SubWordTiming, TranscriptSegment, WordTiming
@@ -31,9 +37,24 @@ MIN_WORD_DURATION_SEC = ALIGNMENT_MIN_WORD_DURATION_MS / 1000.0
 BOUNDARY_SEARCH_SEC = ALIGNMENT_BOUNDARY_SEARCH_MS / 1000.0
 MIN_SUBWORD_DURATION_SEC = 0.012
 HEBREW_NIQQUD_RANGE = range(0x05B0, 0x05C8)
-WHISPERX_SEGMENT_PADDING_SEC = 0.24
-WHISPERX_SEGMENT_RETRY_PADDING_SEC = 0.58
+WHISPERX_SEGMENT_UNION_PADDING_CAP_SEC = 2.0
+SEGMENT_SILENCE_SNAP_SEC = 0.15
 DETAIL_CONFIDENCE_FLOOR = 0.55
+ALIGNED_BOUNDARY_CLAMP_SEC = ALIGNED_BOUNDARY_CLAMP_MS / 1000.0
+
+
+def _is_precisely_aligned(word: WordTiming) -> bool:
+    """True for boundaries measured by wav2vec2 forced alignment.
+
+    Those boundaries must not be dragged around by the energy heuristics —
+    they may only be nudged within ALIGNED_BOUNDARY_CLAMP_SEC.
+    """
+    return (
+        TIMING_REFINE_MODE != "legacy"
+        and word.aligned
+        and word.source == "whisperx"
+        and word.confidence >= DETAIL_CONFIDENCE_FLOOR
+    )
 
 
 def _normalize_word(word: str) -> str:
@@ -261,6 +282,34 @@ def _sanitize_whisperx_metadata(model: object, metadata: dict[str, object]) -> d
         return sanitized
 
     return metadata
+
+
+def _padding_attempts_for_segment(segments: list[TranscriptSegment], index: int) -> list[float]:
+    """Padding sequence for WhisperX per-segment alignment.
+
+    Two fixed attempts, plus a third "union" attempt that widens the window up
+    to the neighboring segments when review edits may have shifted the true
+    audio outside the tightly padded window.
+    """
+    attempts = [WHISPERX_SEGMENT_PADDING_SEC, WHISPERX_SEGMENT_RETRY_PADDING_SEC]
+    segment = segments[index]
+    previous_end = segments[index - 1].end if index > 0 else 0.0
+    next_start = (
+        segments[index + 1].start
+        if index + 1 < len(segments)
+        else segment.end + WHISPERX_SEGMENT_UNION_PADDING_CAP_SEC
+    )
+    union_padding = min(
+        WHISPERX_SEGMENT_UNION_PADDING_CAP_SEC,
+        max(
+            WHISPERX_SEGMENT_RETRY_PADDING_SEC,
+            segment.start - previous_end,
+            next_start - segment.end,
+        ),
+    )
+    if union_padding > WHISPERX_SEGMENT_RETRY_PADDING_SEC + 1e-6:
+        attempts.append(union_padding)
+    return attempts
 
 
 def _build_whisperx_payload_for_segment(segment: TranscriptSegment, padding_seconds: float) -> list[dict[str, object]]:
@@ -513,7 +562,7 @@ def _words_from_whisperx_segment(
                 start=start,
                 end=end,
                 confidence=confidence,
-                source="forced_aligner",
+                source="whisperx" if aligned else "forced_aligner",
                 aligned=aligned,
                 subwords=subwords,
                 char_timings=_character_timings_from_subwords(subwords),
@@ -1308,9 +1357,13 @@ def _repair_aligned_word_details(segments: list[TranscriptSegment]) -> list[Tran
     return repaired_segments
 
 
-def _should_preserve_existing_word_details(source_word: WordTiming, target_word: WordTiming) -> bool:
+def _should_preserve_existing_word_details(
+    source_word: WordTiming, target_word: WordTiming, *, force: bool = False
+) -> bool:
     if not _word_detail_alignment_is_reliable(source_word):
         return False
+    if force:
+        return True
 
     source_duration = max(source_word.end - source_word.start, 1e-6)
     target_duration = max(target_word.end - target_word.start, 1e-6)
@@ -1708,24 +1761,39 @@ def _refine_word_timings(
         logger.warning("Audio refinement skipped for %s: %s", audio_path, exc)
         return _apply_frame_snapping(words, video_frame_rate)
 
+    protected = [_is_precisely_aligned(word) for word in words]
+
+    def _clamped(value: float, anchor: float, is_protected: bool) -> float:
+        if not is_protected:
+            return value
+        return min(max(value, anchor - ALIGNED_BOUNDARY_CLAMP_SEC), anchor + ALIGNED_BOUNDARY_CLAMP_SEC)
+
     refined_words = [
         WordTiming(
             word=word.word,
-            start=_find_word_onset(word, energy, hop_seconds, features=features),
-            end=_find_word_offset(word, energy, hop_seconds, features=features),
+            start=_clamped(
+                _find_word_onset(word, energy, hop_seconds, features=features), word.start, is_protected
+            ),
+            end=_clamped(
+                _find_word_offset(word, energy, hop_seconds, features=features), word.end, is_protected
+            ),
             confidence=word.confidence,
             source=word.source,
             aligned=word.aligned,
         )
-        for word in words
+        for word, is_protected in zip(words, protected)
     ]
 
     for index in range(len(refined_words) - 1):
         boundary = _find_inter_word_boundary(
             refined_words[index], refined_words[index + 1], energy, hop_seconds, features=features,
         )
-        refined_words[index].end = min(refined_words[index].end, boundary)
-        refined_words[index + 1].start = max(refined_words[index + 1].start, boundary)
+        refined_words[index].end = _clamped(
+            min(refined_words[index].end, boundary), words[index].end, protected[index]
+        )
+        refined_words[index + 1].start = _clamped(
+            max(refined_words[index + 1].start, boundary), words[index + 1].start, protected[index + 1]
+        )
 
     stabilized_words = []
     cursor = 0.0
@@ -1750,12 +1818,13 @@ def _refine_word_timings(
     snapped_words = _apply_frame_snapping(stabilized_words, video_frame_rate)
     final_words = []
     for source_word, target_word in zip(words, snapped_words):
-        # Always re-analyze subword boundaries using audio features, even
-        # when the source word already has subword timings from WhisperX.
-        # Linear scaling (_scale_existing_subwords) preserves proportions but
-        # ignores the actual audio — energy+ZCR analysis gives more accurate
-        # letter-level boundaries.
-        if _should_preserve_existing_word_details(source_word, target_word):
+        # wav2vec2 char timings are measured against the audio; keep them
+        # (scaled to the final boundaries) whenever the word is genuinely
+        # forced-aligned. Energy+ZCR re-analysis is the fallback for words
+        # whose detail timings are unreliable or heavily resized.
+        if _should_preserve_existing_word_details(
+            source_word, target_word, force=_is_precisely_aligned(source_word)
+        ):
             subwords = _scale_existing_subwords(source_word, target_word)
             char_timings = _scale_existing_char_timings(source_word, target_word)
         else:
@@ -1915,12 +1984,55 @@ def _clip_segment_overlaps(
     return result
 
 
+def _snap_segment_start_to_silence_edge(segment: TranscriptSegment, features: "AudioFeatures") -> TranscriptSegment:
+    """Pull a segment's first word back to the silence→energy edge just before it.
+
+    Only moves the start EARLIER (never forward, to avoid cutting the onset)
+    and only within SEGMENT_SILENCE_SNAP_SEC.
+    """
+    if not segment.words:
+        return segment
+    first = segment.words[0]
+    frames = len(features.energy)
+    anchor = _time_to_index(first.start, features.hop_seconds, frames)
+    back = _time_to_index(max(0.0, first.start - SEGMENT_SILENCE_SNAP_SEC), features.hop_seconds, frames)
+    window = features.energy[back:anchor + 1]
+    if window.size < 3:
+        return segment
+    threshold = max(1e-6, float(np.max(features.energy)) * 0.02)
+    silent = np.where(window < threshold)[0]
+    if silent.size == 0:
+        return segment
+    edge_index = back + int(silent[-1]) + 1
+    new_start = _index_to_time(edge_index, features.hop_seconds)
+    if new_start >= first.start - 1e-4:
+        return segment
+    moved_first = WordTiming(
+        word=first.word,
+        start=round(new_start, 6),
+        end=first.end,
+        confidence=first.confidence,
+        source=first.source,
+        aligned=first.aligned,
+        subwords=list(first.subwords),
+        char_timings=list(first.char_timings),
+    )
+    words = [moved_first, *segment.words[1:]]
+    return TranscriptSegment(words=words, text=segment.text, start=words[0].start, end=segment.end)
+
+
 def _refine_segments(
     audio_path: str,
     segments: list[TranscriptSegment],
     video_frame_rate: float | None = None,
 ) -> list[TranscriptSegment]:
     minimum_step = 1.0 / video_frame_rate if video_frame_rate and video_frame_rate > 0 else MIN_WORD_DURATION_SEC
+    snap_features = None
+    if SNAP_SEGMENTS_TO_SILENCE:
+        try:
+            snap_features = _load_audio_features(audio_path)
+        except Exception as exc:
+            logger.info("Silence snapping skipped for %s: %s", audio_path, exc)
     refined_segments = []
     for segment in segments:
         if not segment.words:
@@ -1933,6 +2045,11 @@ def _refine_segments(
             start=refined_words[0].start,
             end=refined_words[-1].end,
         )
+        if snap_features is not None:
+            floor = refined_segments[-1].end if refined_segments and refined_segments[-1].words else 0.0
+            snapped = _snap_segment_start_to_silence_edge(refined_segment, snap_features)
+            if snapped.start >= floor - 1e-6:
+                refined_segment = snapped
         refined_segments.append(refined_segment)
     # Resolve cross-segment overlaps by clipping the previous segment to the
     # next segment's onset. Preserving the next onset is usually more accurate
@@ -2008,6 +2125,10 @@ def _validate_final_segments(segments: list[TranscriptSegment]) -> list[Transcri
 class SequenceHebrewAligner:
     name = "sequence_aligner"
 
+    def __init__(self):
+        self.last_warning_message = ""
+        self.last_provider_used = "sequence"
+
     def align(
         self,
         audio_path: str,
@@ -2015,6 +2136,8 @@ class SequenceHebrewAligner:
         draft_segments: list[TranscriptSegment],
         video_frame_rate: float | None = None,
     ) -> AlignedTranscript:
+        self.last_warning_message = ""
+        self.last_provider_used = "sequence"
         approved_words, _approved_segment_indices = _flatten_words(approved_segments)
         draft_words, _draft_segment_indices = _flatten_words(draft_segments)
         if not approved_words:
@@ -2103,6 +2226,11 @@ class SequenceHebrewAligner:
                 float(segments[-1].end),
             )
             segments = _clone_segments(approved_segments, mark_aligned=True, source="forced_aligner")
+            self.last_provider_used = "approved_preserved"
+            self.last_warning_message = (
+                "היישור מול האודיו לא שיפר את התוצאה, אז נשמר הטיימינג מהתמלול המקורי — "
+                "ייתכן שהסנכרון פחות מדויק בשיר הזה."
+            )
         segments = _repair_aligned_word_details(segments)
         unaligned_count = sum(1 for segment in segments for word in segment.words if not word.aligned)
         return AlignedTranscript(
@@ -2115,6 +2243,8 @@ class SequenceHebrewAligner:
 
 class WhisperXHebrewAligner:
     name = "whisperx_hebrew"
+    last_warning_message = ""
+    last_provider_used = "whisperx"
     _model = None
     _metadata = None
 
@@ -2125,7 +2255,7 @@ class WhisperXHebrewAligner:
             self._model, self._metadata = whisperx.load_align_model(
                 language_code="he",
                 model_name=ALIGNMENT_MODEL_NAME,
-                device="cpu",
+                device=ALIGNMENT_DEVICE or "cpu",
             )
         return self._model, self._metadata
 
@@ -2152,19 +2282,21 @@ class WhisperXHebrewAligner:
         final_segments = []
         unaligned_count = 0
         any_success = False
-        for source_segment in approved_segments:
+        for segment_index, source_segment in enumerate(approved_segments):
             if not source_segment.text.strip():
                 final_segments.append(source_segment)
                 continue
 
             best_candidate: dict[str, object] | None = None
             last_error: Exception | None = None
-            for padding_seconds in (WHISPERX_SEGMENT_PADDING_SEC, WHISPERX_SEGMENT_RETRY_PADDING_SEC):
+            for padding_seconds in _padding_attempts_for_segment(approved_segments, segment_index):
                 payload = _build_whisperx_payload_for_segment(source_segment, padding_seconds)
                 if not payload:
                     continue
                 try:
-                    result = whisperx.align(payload, model, metadata, audio, "cpu", return_char_alignments=True)
+                    result = whisperx.align(
+                        payload, model, metadata, audio, ALIGNMENT_DEVICE or "cpu", return_char_alignments=True
+                    )
                     candidate = _merge_whisperx_aligned_segments(source_segment, result.get("segments", []))
                 except Exception as exc:
                     last_error = exc
@@ -2216,6 +2348,11 @@ class AutoHebrewAligner:
         self.primary = WhisperXHebrewAligner() if importlib.util.find_spec("whisperx") is not None else None
         self.fallback = SequenceHebrewAligner()
         self.last_warning_message = ""
+        self.last_provider_used = ""
+
+    def _merge_fallback_warning(self, own_message: str) -> str:
+        fallback_message = getattr(self.fallback, "last_warning_message", "")
+        return " ".join(message for message in (own_message, fallback_message) if message)
 
     @staticmethod
     def _should_probe_fallback(result: AlignedTranscript) -> bool:
@@ -2239,13 +2376,19 @@ class AutoHebrewAligner:
         video_frame_rate: float | None = None,
     ) -> AlignedTranscript:
         self.last_warning_message = ""
+        self.last_provider_used = ""
         if self.primary is None:
-            return self.fallback.align(
+            result = self.fallback.align(
                 audio_path,
                 approved_segments,
                 draft_segments,
                 video_frame_rate=video_frame_rate,
             )
+            self.last_provider_used = getattr(self.fallback, "last_provider_used", "sequence")
+            self.last_warning_message = self._merge_fallback_warning(
+                "מנוע היישור המדויק (whisperx) לא זמין בסביבה, אז הטיימינג חושב בשיטה חלופית."
+            )
+            return result
 
         try:
             primary_result = self.primary.align(
@@ -2254,6 +2397,7 @@ class AutoHebrewAligner:
                 draft_segments,
                 video_frame_rate=video_frame_rate,
             )
+            self.last_provider_used = "whisperx"
             if not self._should_probe_fallback(primary_result):
                 return primary_result
 
@@ -2269,19 +2413,26 @@ class AutoHebrewAligner:
                 video_frame_rate=video_frame_rate,
             )
             if self._quality_score(fallback_result) > self._quality_score(primary_result) + 0.02:
-                self.last_warning_message = "מנוע היישור הראשי עבד, אבל היישור החלופי יצא מדויק ויציב יותר ולכן נבחר אוטומטית."
+                self.last_provider_used = getattr(self.fallback, "last_provider_used", "sequence")
+                self.last_warning_message = self._merge_fallback_warning(
+                    "מנוע היישור הראשי עבד, אבל היישור החלופי יצא מדויק ויציב יותר ולכן נבחר אוטומטית."
+                )
                 return fallback_result
             self.last_warning_message = "מנוע היישור הראשי השלים יישור, אבל האיכות גבולית ולכן נבדקה גם חלופה אוטומטית."
             return primary_result
         except AlignmentError as exc:
-            self.last_warning_message = "מנוע היישור הראשי נכשל על הטקסט הזה, אז עברתי אוטומטית ליישור חלופי יציב יותר."
             logger.warning("WhisperX alignment failed, falling back to sequence aligner: %s", exc)
-            return self.fallback.align(
+            result = self.fallback.align(
                 audio_path,
                 approved_segments,
                 draft_segments,
                 video_frame_rate=video_frame_rate,
             )
+            self.last_provider_used = getattr(self.fallback, "last_provider_used", "sequence")
+            self.last_warning_message = self._merge_fallback_warning(
+                "מנוע היישור הראשי נכשל על הטקסט הזה, אז עברתי אוטומטית ליישור חלופי יציב יותר."
+            )
+            return result
 
 
 def get_alignment_provider():
