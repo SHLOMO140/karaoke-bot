@@ -281,51 +281,6 @@ def _extract_title_context(title: str) -> dict[str, str]:
     }
 
 
-def _build_query_variants(title: str, draft_text: str) -> list[str]:
-    context = _extract_title_context(title)
-    clean_title = context["clean_title"]
-    hebrew_artist = context["hebrew_artist"]
-    latin_artist = context["latin_artist"]
-    song = context["song"]
-    keywords = _top_keywords(draft_text, limit=8)
-    keyword_tail = " ".join(keywords[:4])
-
-    queries = []
-    if hebrew_artist and song:
-        queries.extend(
-            [
-                f"{hebrew_artist} {song} מילים",
-                f"{song} {hebrew_artist} מילים",
-                f"\"{hebrew_artist}\" \"{song}\" מילים",
-            ]
-        )
-    if latin_artist and song:
-        queries.extend(
-            [
-                f"\"{latin_artist}\" \"{song}\" lyrics",
-                f"{latin_artist} {song} lyrics",
-            ]
-        )
-    for domain in SITE_QUERY_DOMAINS:
-        suffix = "lyrics" if domain in {"genius.com", "lyricstranslate.com"} else "מילים"
-        if hebrew_artist and song:
-            queries.append(f"site:{domain} \"{hebrew_artist}\" \"{song}\" {suffix}")
-        if latin_artist and song:
-            queries.append(f"site:{domain} \"{latin_artist}\" \"{song}\" {suffix}")
-    if clean_title:
-        queries.append(f"{clean_title} מילים")
-        queries.append(f"{clean_title} lyrics")
-        if keyword_tail:
-            queries.append(f"{clean_title} {keyword_tail}")
-    elif keyword_tail:
-        queries.append(f"{keyword_tail} מילים")
-
-    if keyword_tail:
-        queries.append(f"מילים לשיר {keyword_tail}")
-
-    return list(dict.fromkeys(query for query in queries if query.strip()))
-
-
 def _align_source_to_segments(
     source_tokens: list[str],
     draft: TranscriptDraft,
@@ -436,142 +391,6 @@ def _align_source_to_segments(
     return result, correction_count
 
 
-def _extract_site_specific_lyrics(url: str, page_html: str) -> str | None:
-    """חילוץ ממוקד לאתרים ידועים לפי CSS selectors אופייניים."""
-    domain = _domain_from_url(url)
-
-    if "shironet" in domain:
-        match = re.search(r'id=["\']artist_lyrics(?:_text)?["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-
-    if "tab4u" in domain:
-        match = re.search(r'id=["\']songContentTPL["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-        song_cells = re.findall(
-            r'<td[^>]+class=["\'][^"\']*\bsong\b[^"\']*["\'][^>]*>(.*?)</td>',
-            page_html,
-            re.S | re.I,
-        )
-        if song_cells:
-            return "<br>".join(song_cells)
-        match = re.search(r'id=["\']songLyricsDiv["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-
-    if "nagnu" in domain:
-        if 'q:route="track/lyrics/' in page_html:
-            return page_html
-        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-
-    # shirrim.com – lyrics appear right after the "המילים של השיר:" text heading
-    # Actual HTML: ">המילים של השיר: <br>\n<p>line1<br />line2..."
-    if "shirrim" in domain:
-        match = re.search(
-            r'\u05d4\u05de\u05d9\u05dc\u05d9\u05dd \u05e9\u05dc \u05d4\u05e9\u05d9\u05e8'
-            r'[^<]*(?:<[^>]+>\s*){1,3}<p>(.*?)</p>',
-            page_html,
-            re.S | re.I,
-        )
-        if match:
-            return match.group(1)
-
-    # nomorelyrics.net – lyrics inside element with id/class "songtext"
-    if "nomorelyrics" in domain:
-        match = re.search(r'(?:id|class)=["\']songtext["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-
-    # baneshama.co.il – Hebrew lyrics site
-    if "baneshama" in domain:
-        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-        match = re.search(r'class=["\'][^"\']*song[_-]?text[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-
-    # nagina.co.il – Nagina Mizrahit, Mizrahi/Eastern music lyrics site
-    # Guard against matching nagnu.co.il which has its own parser above
-    if "nagina" in domain and "nagnu" not in domain:
-        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-        match = re.search(r'class=["\'][^"\']*song[_-]?content[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
-        if match:
-            return match.group(1)
-
-    return None
-
-
-def _find_best_lyrics_window(page_html: str, draft: TranscriptDraft) -> tuple[float, list[str], int]:
-    draft_tokens = [_normalize_token(token) for token in _tokenize_words(draft.text)]
-    if not draft_tokens:
-        return 0.0, [], 0
-
-    cleaned = _strip_html_preserving_lines(page_html)
-    raw_lines: list[list[str]] = []
-    for line in cleaned.splitlines():
-        tokens = _tokenize_words(line)
-        hebrew_tokens = [token for token in tokens if re.search(r"[\u0590-\u05FF]", token)]
-        if len(hebrew_tokens) >= 2:
-            raw_lines.append(hebrew_tokens)
-
-    if not raw_lines:
-        return 0.0, [], 0
-
-    draft_token_set = set(draft_tokens)
-    target_words = len(draft_tokens)
-    target_line_count = max(1, len([seg for seg in draft.segments if seg.text.strip()]))
-    min_window_lines = max(1, target_line_count - 3)
-    max_window_lines = max(min_window_lines, target_line_count + 4)
-
-    def _score_window(candidate_tokens: list[str]) -> float:
-        normalized = [_normalize_token(t) for t in candidate_tokens]
-        ratio = SequenceMatcher(None, draft_tokens, normalized, autojunk=False).ratio()
-        overlap = len(draft_token_set & set(normalized)) / max(1, len(draft_token_set))
-        return ratio * 0.72 + overlap * 0.28
-
-    # Fast path: source page has roughly the same number of lines as the draft
-    if min_window_lines <= len(raw_lines) <= max_window_lines:
-        flattened = [t for line in raw_lines for t in line]
-        score = _score_window(flattened)
-        if score >= 0.45:
-            corrected_lines, correction_count = _align_source_to_segments(flattened, draft)
-            return score, corrected_lines, correction_count
-
-    # Sliding-window search: find the source sub-section that best matches the draft
-    best_score = 0.0
-    best_tokens: list[str] = []
-
-    for start in range(len(raw_lines)):
-        collected: list[str] = []
-        max_end = min(len(raw_lines), start + max_window_lines)
-        for end in range(start, max_end):
-            collected.extend(raw_lines[end])
-            window_line_count = end - start + 1
-            if len(collected) > int(target_words * 1.5) + 8:
-                break
-            if window_line_count < min_window_lines:
-                continue
-            if len(collected) < max(4, int(target_words * 0.55)):
-                continue
-
-            score = _score_window(collected)
-            if score > best_score:
-                best_score = score
-                best_tokens = collected[:]
-
-    if not best_tokens:
-        return 0.0, [], 0
-
-    corrected_lines, correction_count = _align_source_to_segments(best_tokens, draft)
-    return best_score, corrected_lines, correction_count
-
-
 _BOT_BLOCK_SIGNATURES = (
     "Radware Block Page",
     "cf-browser-verification",
@@ -625,34 +444,6 @@ def _parse_duckduckgo_results(html_text: str) -> list[SearchResult]:
         url = _decode_redirect(title_match.group("href"))
         results.append(SearchResult(title=title, snippet=snippet, url=url))
     return results
-
-
-def _search_duckduckgo_results(query: str) -> list[SearchResult]:
-    cached = SEARCH_RESULT_CACHE.get(query)
-    if cached is not None:
-        return cached
-
-    encoded_query = urllib.parse.quote_plus(query)
-    last_error: Exception | None = None
-    for endpoint in (DUCKDUCKGO_HTML_SEARCH, DUCKDUCKGO_HTML_FALLBACK):
-        try:
-            html_text = _fetch_text(endpoint.format(query=encoded_query))
-            results = _parse_duckduckgo_results(html_text)
-            if results:
-                SEARCH_RESULT_CACHE[query] = results
-                return results
-        except HTTPError as exc:
-            last_error = exc
-            logger.info("DuckDuckGo search endpoint failed for %s: %s", query, exc)
-            continue
-        except Exception as exc:
-            last_error = exc
-            logger.info("DuckDuckGo search parse failed for %s: %s", query, exc)
-            continue
-
-    if last_error:
-        logger.info("All DuckDuckGo search endpoints failed for %s: %s", query, last_error)
-    return []
 
 
 def _domain_from_url(url: str) -> str:
@@ -880,14 +671,6 @@ def _draft_lines(draft: TranscriptDraft) -> list[str]:
     if lines:
         return lines
     return [draft.text.strip()] if draft.text.strip() else []
-
-
-def _line_similarity(left: str, right: str) -> float:
-    left_tokens = [_normalize_token(token) for token in _tokenize_words(left)]
-    right_tokens = [_normalize_token(token) for token in _tokenize_words(right)]
-    if not left_tokens or not right_tokens:
-        return 0.0
-    return SequenceMatcher(None, left_tokens, right_tokens, autojunk=False).ratio()
 
 
 def _count_token_corrections(reference_lines: list[str], candidate_lines: list[str]) -> int:
@@ -2079,61 +1862,6 @@ class MultiStepLyricsVerifier:
         pass
 
 
-def _build_query_variants(title: str, draft_text: str) -> list[str]:
-    context = _extract_title_context(title)
-    clean_title = context["clean_title"]
-    hebrew_artist = context["hebrew_artist"]
-    latin_artist = context["latin_artist"]
-    song = context["song"]
-    keywords = _top_keywords(draft_text, limit=8)
-    keyword_tail = " ".join(keywords[:4])
-    lyric_snippets = _draft_search_snippets(draft_text, limit=3)
-
-    queries = []
-    if hebrew_artist and song:
-        queries.extend(
-            [
-                f"{hebrew_artist} {song} ׳׳™׳׳™׳",
-                f"{song} {hebrew_artist} ׳׳™׳׳™׳",
-                f"\"{hebrew_artist}\" \"{song}\" ׳׳™׳׳™׳",
-            ]
-        )
-    if latin_artist and song:
-        queries.extend(
-            [
-                f"\"{latin_artist}\" \"{song}\" lyrics",
-                f"{latin_artist} {song} lyrics",
-            ]
-        )
-    if clean_title:
-        queries.append(f"{clean_title} ׳׳™׳׳™׳")
-        queries.append(f"{clean_title} lyrics")
-    if song:
-        queries.append(f"\"{song}\" ׳׳™׳׳™׳")
-        queries.append(f"\"{song}\" lyrics")
-    for snippet in lyric_snippets[:2]:
-        if song:
-            queries.append(f"\"{song}\" \"{snippet}\" ׳׳™׳׳™׳")
-        queries.append(f"\"{snippet}\" ׳׳™׳׳™׳")
-    for domain in SITE_QUERY_DOMAINS:
-        suffix = "lyrics" if domain in {"genius.com", "lyricstranslate.com"} else "׳׳™׳׳™׳"
-        if hebrew_artist and song:
-            queries.append(f"site:{domain} \"{hebrew_artist}\" \"{song}\" {suffix}")
-        if latin_artist and song:
-            queries.append(f"site:{domain} \"{latin_artist}\" \"{song}\" {suffix}")
-        for snippet in lyric_snippets[:1]:
-            queries.append(f"site:{domain} \"{snippet}\" {suffix}")
-    if clean_title and keyword_tail:
-        queries.append(f"{clean_title} {keyword_tail}")
-    elif keyword_tail:
-        queries.append(f"{keyword_tail} ׳׳™׳׳™׳")
-
-    if keyword_tail:
-        queries.append(f"׳׳™׳׳™׳ ׳׳©׳™׳¨ {keyword_tail}")
-
-    return list(dict.fromkeys(query for query in queries if query.strip()))
-
-
 def _relax_search_queries(query: str) -> list[str]:
     variants: list[str] = []
 
@@ -2787,130 +2515,6 @@ def _coerce_search_draft(draft_or_text: TranscriptDraft | str) -> TranscriptDraf
     return _build_synthetic_draft_from_text(draft_or_text)
 
 
-def _multistep_search_all_sources_override(
-    self,
-    title: str,
-    draft_or_text: TranscriptDraft | str,
-) -> dict[str, list[str]]:
-    import concurrent.futures
-
-    draft = _coerce_search_draft(draft_or_text)
-    draft_text = draft.text
-    draft_lines = _draft_lines(draft)
-    queries = _build_query_variants(title, draft_text)
-    context = _extract_title_context(title)
-    sources: dict[str, tuple[float, list[str]]] = {}
-    urls_by_domain: dict[str, list[str]] = {}
-    google_failed = False
-
-    def _remember_result(result) -> None:
-        url = getattr(result, "url", "")
-        if not url:
-            return
-        domain = _domain_from_url(url)
-        if not any(domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS):
-            return
-        if not _looks_like_lyrics_result(result):
-            return
-        if not _matches_title_context(result, context):
-            haystack = f"{getattr(result, 'title', '')} {getattr(result, 'snippet', '')}"
-            if _text_overlap_score(set(_top_keywords(context["song"], limit=4)), haystack) < 0.25:
-                return
-        domain_urls = urls_by_domain.setdefault(domain, [])
-        if url not in domain_urls and len(domain_urls) < 2:
-            domain_urls.append(url)
-
-    for query in queries[:5]:
-        try:
-            results = self._google.search(query, num=10)
-            for result in results:
-                _remember_result(result)
-        except Exception as exc:
-            logger.warning("Google search failed for query '%s': %s", query, exc)
-            if "429" in str(exc):
-                google_failed = True
-                break
-
-    if google_failed or len(urls_by_domain) < 2:
-        for query in queries[:5]:
-            try:
-                results = _search_web_results(query)
-                for result in results:
-                    _remember_result(result)
-            except Exception as exc:
-                logger.warning("Web fallback search failed: %s", exc)
-
-    def _fetch_and_parse(url: str) -> tuple[str, list[str], float]:
-        source_key = _domain_option_key(url)
-        try:
-            html_body = _fetch_text(url, timeout=15)
-            if _is_bot_blocked(html_body):
-                return source_key, [], 0.0
-
-            specific = _extract_site_specific_lyrics(url, html_body)
-            effective_html = specific if specific else html_body
-            window_score, corrected_lines, _correction_count = _find_best_lyrics_window(effective_html, draft)
-            if corrected_lines and window_score >= 0.18:
-                return source_key, corrected_lines, window_score
-
-            if specific:
-                extracted_entries = _extract_candidate_lyrics_line_entries(specific, draft_lines)
-                extracted_lines = [line for line, _tokens in extracted_entries]
-                if extracted_lines and len(extracted_lines) <= len(draft_lines) + 2:
-                    expanded_lines = _expand_repeated_candidate_lines(draft_lines, extracted_lines)
-                    repaired_lines, repaired_corrections = _repair_draft_lines_from_source_lines(
-                        draft_lines,
-                        expanded_lines,
-                    )
-                    paired_scores = [
-                        max(_line_similarity(left, right), _line_token_overlap(left, right))
-                        for left, right in zip(draft_lines, repaired_lines)
-                    ]
-                    fallback_score = sum(paired_scores) / max(1, len(paired_scores))
-                    if repaired_corrections > 0 and fallback_score >= 0.48:
-                        return source_key, repaired_lines, fallback_score
-        except Exception as exc:
-            logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
-        return source_key, [], 0.0
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(_fetch_and_parse, url): url
-            for domain_urls in urls_by_domain.values()
-            for url in domain_urls
-        }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                key, lines, score = future.result()
-                if lines and (key not in sources or score > sources[key][0]):
-                    sources[key] = (score, lines)
-            except Exception as exc:
-                logger.warning("Source fetch error: %s", exc)
-
-    try:
-        yt_results = self._youtube.search(f"{title} ׳׳™׳׳™׳", max_results=3)
-        for yt_result in yt_results:
-            desc = yt_result.snippet
-            if desc and re.search(r"[\u0590-\u05FF]", desc):
-                lines = [
-                    line.strip()
-                    for line in desc.splitlines()
-                    if line.strip() and re.search(r"[\u0590-\u05FF]", line) and len(line.strip()) >= 2
-                ]
-                prepared_lines = _expand_repeated_candidate_lines(draft_lines, lines)
-                if len(prepared_lines) >= max(3, min(3, len(draft_lines))):
-                    sources[f"youtube_{yt_result.title[:20]}"] = (0.25, prepared_lines)
-                    break
-    except Exception as exc:
-        logger.warning("YouTube search failed: %s", exc)
-
-    return {source_name: lines for source_name, (_score, lines) in sources.items()}
-
-
-MultiStepLyricsVerifier._search_all_sources = _multistep_search_all_sources_override
-
-
-_PREVIOUS_EXTRACT_SITE_SPECIFIC_LYRICS = _extract_site_specific_lyrics
 _DIRECT_SITE_SEARCH_CACHE: dict[str, list[SearchResult]] = {}
 _SITEMAP_URL_CACHE: dict[str, list[str]] = {}
 _WEAK_CONTEXT_TOKENS = {"lyrics", "lyric", "song", "מילים", "שיר"}
@@ -3344,144 +2948,84 @@ def _clean_tab4u_lyrics_html(page_html: str) -> str | None:
     return lyrics_block
 
 
+def _extract_site_specific_lyrics_base(url: str, page_html: str) -> str | None:
+    """חילוץ ממוקד לאתרים ידועים לפי CSS selectors אופייניים."""
+    domain = _domain_from_url(url)
+
+    if "shironet" in domain:
+        match = re.search(r'id=["\']artist_lyrics(?:_text)?["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    if "tab4u" in domain:
+        match = re.search(r'id=["\']songContentTPL["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+        song_cells = re.findall(
+            r'<td[^>]+class=["\'][^"\']*\bsong\b[^"\']*["\'][^>]*>(.*?)</td>',
+            page_html,
+            re.S | re.I,
+        )
+        if song_cells:
+            return "<br>".join(song_cells)
+        match = re.search(r'id=["\']songLyricsDiv["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    if "nagnu" in domain:
+        if 'q:route="track/lyrics/' in page_html:
+            return page_html
+        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    # shirrim.com – lyrics appear right after the "המילים של השיר:" text heading
+    # Actual HTML: ">המילים של השיר: <br>\n<p>line1<br />line2..."
+    if "shirrim" in domain:
+        match = re.search(
+            r'המילים של השיר'
+            r'[^<]*(?:<[^>]+>\s*){1,3}<p>(.*?)</p>',
+            page_html,
+            re.S | re.I,
+        )
+        if match:
+            return match.group(1)
+
+    # nomorelyrics.net – lyrics inside element with id/class "songtext"
+    if "nomorelyrics" in domain:
+        match = re.search(r'(?:id|class)=["\']songtext["\'][^>]*>(.*?)</div', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    # baneshama.co.il – Hebrew lyrics site
+    if "baneshama" in domain:
+        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r'class=["\'][^"\']*song[_-]?text[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    # nagina.co.il – Nagina Mizrahit, Mizrahi/Eastern music lyrics site
+    # Guard against matching nagnu.co.il which has its own parser above
+    if "nagina" in domain and "nagnu" not in domain:
+        match = re.search(r'class=["\'][^"\']*lyrics[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r'class=["\'][^"\']*song[_-]?content[^"\']*["\'][^>]*>(.*?)</(?:div|pre)', page_html, re.S | re.I)
+        if match:
+            return match.group(1)
+
+    return None
+
+
 def _extract_site_specific_lyrics(url: str, page_html: str) -> str | None:
     domain = _domain_from_url(url)
     if "tab4u" in domain:
         cleaned_tab4u = _clean_tab4u_lyrics_html(page_html)
         if cleaned_tab4u:
             return cleaned_tab4u
-    return _PREVIOUS_EXTRACT_SITE_SPECIFIC_LYRICS(url, page_html)
-
-
-def _multistep_search_all_sources_override(
-    self,
-    title: str,
-    draft_or_text: TranscriptDraft | str,
-) -> dict[str, list[str]]:
-    import concurrent.futures
-
-    draft = _coerce_search_draft(draft_or_text)
-    draft_text = draft.text
-    draft_lines = _draft_lines(draft)
-    queries = _build_query_variants(title, draft_text)
-    context = _extract_title_context(title)
-    sources: dict[str, tuple[float, list[str]]] = {}
-    urls_by_domain: dict[str, list[str]] = {}
-    google_failed = False
-
-    def _remember_result(result) -> None:
-        url = _canonicalize_lyrics_source_url(getattr(result, "url", ""))
-        if not url:
-            return
-
-        domain = _domain_from_url(url)
-        if not any(domain.endswith(candidate) for candidate in KNOWN_LYRICS_DOMAINS):
-            return
-
-        result_for_match = SearchResult(
-            title=getattr(result, "title", "") or _search_result_title_from_url(url),
-            snippet=getattr(result, "snippet", ""),
-            url=url,
-        )
-        if not _looks_like_lyrics_result(result_for_match):
-            return
-        if not _matches_title_context(result_for_match, context):
-            result_for_match = SearchResult(
-                title=_search_result_title_from_url(url),
-                snippet=result_for_match.snippet,
-                url=url,
-            )
-            if not _matches_title_context(result_for_match, context):
-                return
-
-        domain_urls = urls_by_domain.setdefault(domain, [])
-        if url not in domain_urls and len(domain_urls) < 3:
-            domain_urls.append(url)
-
-    for query in queries[:5]:
-        try:
-            results = self._google.search(query, num=10)
-            for result in results:
-                _remember_result(result)
-        except Exception as exc:
-            logger.warning("Google search failed for query '%s': %s", query, exc)
-            if "429" in str(exc):
-                google_failed = True
-                break
-
-    if google_failed or len(urls_by_domain) < 2:
-        for query in queries[:5]:
-            try:
-                results = _search_web_results(query)
-                for result in results:
-                    _remember_result(result)
-            except Exception as exc:
-                logger.warning("Web fallback search failed: %s", exc)
-
-    if len(urls_by_domain) < 2:
-        for result in _search_known_site_results(title, queries, context):
-            _remember_result(result)
-
-    def _fetch_and_parse(url: str) -> tuple[str, list[str], float]:
-        source_key = _domain_option_key(url)
-        try:
-            html_body = _fetch_text(url, timeout=15)
-            if _is_bot_blocked(html_body):
-                return source_key, [], 0.0
-
-            specific = _extract_site_specific_lyrics(url, html_body)
-            effective_html = specific if specific else html_body
-            window_score, corrected_lines, _correction_count = _find_best_lyrics_window(effective_html, draft)
-            if corrected_lines and window_score >= 0.18:
-                return source_key, corrected_lines, window_score
-
-            extracted_entries = _extract_candidate_lyrics_line_entries(effective_html, draft_lines)
-            extracted_lines = [line for line, _tokens in extracted_entries]
-            repaired_lines, repaired_corrections, repair_score = _repair_draft_from_candidate_lines(
-                draft_lines,
-                extracted_lines,
-            )
-            if repaired_lines and (repair_score >= 0.5 or (repaired_corrections > 0 and repair_score >= 0.46)):
-                return source_key, repaired_lines, repair_score
-        except Exception as exc:
-            logger.warning("Failed to fetch lyrics from %s: %s", url, exc)
-        return source_key, [], 0.0
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(_fetch_and_parse, url): url
-            for domain_urls in urls_by_domain.values()
-            for url in domain_urls
-        }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                key, lines, score = future.result()
-                if lines and (key not in sources or score > sources[key][0]):
-                    sources[key] = (score, lines)
-            except Exception as exc:
-                logger.warning("Source fetch error: %s", exc)
-
-    try:
-        yt_results = self._youtube.search(f"{title} {HEBREW_LYRICS_QUERY}", max_results=3)
-        for yt_result in yt_results:
-            desc = yt_result.snippet
-            if desc and re.search(r"[\u0590-\u05FF]", desc):
-                lines = [
-                    line.strip()
-                    for line in desc.splitlines()
-                    if line.strip() and re.search(r"[\u0590-\u05FF]", line) and len(line.strip()) >= 2
-                ]
-                prepared_lines = _expand_repeated_candidate_lines(draft_lines, lines)
-                if len(prepared_lines) >= max(3, min(3, len(draft_lines))):
-                    sources[f"youtube_{yt_result.title[:20]}"] = (0.25, prepared_lines)
-                    break
-    except Exception as exc:
-        logger.warning("YouTube search failed: %s", exc)
-
-    return {source_name: lines for source_name, (_score, lines) in sources.items()}
-
-
-MultiStepLyricsVerifier._search_all_sources = _multistep_search_all_sources_override
+    return _extract_site_specific_lyrics_base(url, page_html)
 
 
 def _build_query_variants(title: str, draft_text: str) -> list[str]:

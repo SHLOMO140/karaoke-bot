@@ -11,12 +11,19 @@ from pathlib import Path
 import yt_dlp
 
 from .audio_extractor import transcode_to_mp3
-from .config import FFMPEG_PATH, HIGH_QUALITY_MP3_BITRATE, PYTHON_EXE, YTDLP_STAGING_DIR, ytdlp_base_opts
+from .config import (
+    FFMPEG_PATH,
+    HIGH_QUALITY_MP3_BITRATE,
+    MAX_TELEGRAM_FILE_SIZE,
+    PYTHON_EXE,
+    YTDLP_STAGING_DIR,
+    ytdlp_base_opts,
+)
 from .exceptions import AudioExtractionError, DownloadError
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-MAX_SIZE = 45 * 1024 * 1024
+MAX_SIZE = MAX_TELEGRAM_FILE_SIZE
 STAGING_DIR = YTDLP_STAGING_DIR / "legacy_media"
 STAGING_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_CACHE_REVISION = "hq-v2"
@@ -212,6 +219,7 @@ def remove_vocals_demucs(input_path: str, output_path: str):
             result2 = subprocess.run(
                 [ffmpeg_exe, "-y", "-i", no_vocals, "-c:a", "libmp3lame", "-b:a", HIGH_QUALITY_MP3_BITRATE, output_path],
                 capture_output=True,
+                timeout=600,
             )
             if result2.returncode != 0:
                 raise RuntimeError(result2.stderr.decode(errors="ignore")[-400:])
@@ -263,7 +271,7 @@ def compress_video(input_path: str, output_path: str, duration: float):
         "-an",
         "-f",
         "null",
-        "NUL",
+        "-",
     ]
     cmd2 = [
         ffmpeg_exe,
@@ -286,12 +294,18 @@ def compress_video(input_path: str, output_path: str, duration: float):
         "+faststart",
         output_path,
     ]
-    result1 = subprocess.run(cmd1, capture_output=True)
-    result2 = subprocess.run(cmd2, capture_output=True)
-    if result1.returncode != 0 or result2.returncode != 0:
-        raise RuntimeError("דחיסת הווידאו נכשלה.")
-    for item in DOWNLOAD_DIR.resolve().glob(f"{Path(pass_log).name}*"):
-        item.unlink(missing_ok=True)
+    try:
+        result1 = subprocess.run(cmd1, capture_output=True, timeout=1800)
+        if result1.returncode != 0:
+            raise RuntimeError("דחיסת הווידאו נכשלה.")
+        result2 = subprocess.run(cmd2, capture_output=True, timeout=1800)
+        if result2.returncode != 0:
+            raise RuntimeError("דחיסת הווידאו נכשלה.")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("דחיסת הווידאו נכשלה.") from exc
+    finally:
+        for item in DOWNLOAD_DIR.resolve().glob(f"{Path(pass_log).name}*"):
+            item.unlink(missing_ok=True)
 
 
 def download_video(url: str, quality: str) -> tuple[str, str]:
@@ -333,6 +347,14 @@ def download_video(url: str, quality: str) -> tuple[str, str]:
             compressed.unlink(missing_ok=True)
             compress_video(str(src.resolve()), str(compressed.resolve()), duration)
             compressed.rename(dst)
+            # Two-pass VBR can overshoot the target; verify before Telegram
+            # rejects the upload with an opaque 413.
+            if dst.stat().st_size > MAX_SIZE:
+                dst.unlink(missing_ok=True)
+                raise DownloadError(
+                    "Compressed video still exceeds the Telegram upload limit.",
+                    "הסרטון גדול מדי גם אחרי דחיסה. נסה איכות נמוכה יותר.",
+                )
         else:
             shutil.copy2(src, dst)
         return str(dst.resolve()), title

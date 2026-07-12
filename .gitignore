@@ -4,10 +4,15 @@
 __pycache__/
 *.pyc
 .cache/
+.pytest_cache/
 downloads/
+jobs/
+logs/
 *.log
 .debug_bot_*.txt
 bot_token.txt
 cookies.txt
 firebase-debug*.log
 .claude/
+nul
+tmp_*.png

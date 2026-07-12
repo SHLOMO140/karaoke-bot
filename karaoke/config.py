@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
-import re
+import shutil
+import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -72,17 +76,35 @@ for env_name, default_path in {
 
 PYTHON_EXE = os.getenv(
     "KARAOKE_PYTHON_EXE",
-    str(LOCAL_VENV_PYTHON if LOCAL_VENV_PYTHON.exists() else Path(r"C:\Users\shlom\AppData\Local\Programs\Python\Python312\python.exe")),
+    str(LOCAL_VENV_PYTHON if LOCAL_VENV_PYTHON.exists() else Path(sys.executable)),
 )
 
-FFMPEG_PATH = Path(
-    os.getenv(
-        "KARAOKE_FFMPEG_DIR",
-        r"C:\Users\shlom\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin",
-    )
-)
+
+def _discover_ffmpeg_dir() -> str:
+    """Resolve the ffmpeg directory: env var, PATH, then known install spots."""
+    env_dir = os.getenv("KARAOKE_FFMPEG_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    which = shutil.which("ffmpeg")
+    if which:
+        return str(Path(which).parent)
+    for candidate in (
+        Path(r"C:\Users\shlom\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin"),
+        Path(r"C:\ffmpeg\bin"),
+    ):
+        if (candidate / "ffmpeg.exe").exists():
+            return str(candidate)
+    return r"C:\ffmpeg\bin"
+
+
+FFMPEG_PATH = Path(_discover_ffmpeg_dir())
 FFMPEG_EXE = str(FFMPEG_PATH / "ffmpeg.exe")
 FFPROBE_EXE = str(FFMPEG_PATH / "ffprobe.exe")
+if not Path(FFMPEG_EXE).exists():
+    logger.warning(
+        "ffmpeg not found (looked in KARAOKE_FFMPEG_DIR, PATH and known install dirs); "
+        "media processing will fail until ffmpeg is installed or KARAOKE_FFMPEG_DIR is set."
+    )
 
 def _load_env_value(path: Path, key_names: set[str]) -> str:
     """Load a value from a .env file by matching any of the given key names."""
@@ -100,18 +122,6 @@ def _load_env_value(path: Path, key_names: set[str]) -> str:
 
 def _load_token_from_env_file(path: Path) -> str:
     return _load_env_value(path, {"TELEGRAM_BOT_TOKEN", "BOT_TOKEN"})
-
-
-def _recover_token_from_pyc() -> str:
-    pattern = re.compile(rb"\d{8,12}:[A-Za-z0-9_-]{20,}")
-    pycache_dir = BASE_DIR / "__pycache__"
-    if not pycache_dir.exists():
-        return ""
-    for path in sorted(pycache_dir.glob("bot*.pyc*"), reverse=True):
-        match = pattern.search(path.read_bytes())
-        if match:
-            return match.group(0).decode("utf-8", errors="ignore")
-    return ""
 
 
 def load_telegram_bot_token() -> str:
@@ -132,9 +142,6 @@ def load_telegram_bot_token() -> str:
         if value:
             return value
 
-    recovered = _recover_token_from_pyc()
-    if recovered:
-        return recovered
     return ""
 
 

@@ -1,8 +1,11 @@
 import atexit
 import asyncio
+import contextlib
+import contextvars
 import ctypes
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -12,7 +15,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from karaoke import job_manager
@@ -93,6 +96,36 @@ def run_storage_maintenance():
     if len(removed) > 8:
         summary += ", ..."
     logger.info("Storage cleanup removed %d old jobs: %s", len(removed), summary)
+
+
+# One demucs/whisper/ffmpeg pipeline at a time: concurrent_updates(True) would
+# otherwise let several CPU-heavy jobs thrash the machine until they all time out.
+HEAVY_JOB_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("KARAOKE_MAX_CONCURRENT_HEAVY_JOBS", "1"))))
+_HEAVY_SLOT_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar("heavy_slot_held", default=False)
+
+
+@contextlib.asynccontextmanager
+async def heavy_job_slot(message=None):
+    if _HEAVY_SLOT_HELD.get():
+        # Re-entrant within the same update (e.g. repair -> generate_karaoke_output).
+        yield
+        return
+    if HEAVY_JOB_SEMAPHORE.locked() and message is not None:
+        try:
+            await message.reply_text("הבקשה נכנסה לתור, ממתין לסיום עבודה קודמת...")
+        except Exception:
+            logger.info("Could not send queue notice for a waiting heavy job.")
+    async with HEAVY_JOB_SEMAPHORE:
+        token = _HEAVY_SLOT_HELD.set(True)
+        try:
+            yield
+        finally:
+            _HEAVY_SLOT_HELD.reset(token)
+
+
+async def run_heavy_in_executor(message, func, *args):
+    async with heavy_job_slot(message):
+        return await asyncio.get_running_loop().run_in_executor(None, func, *args)
 
 
 def cleanup_delivered_job(job: Job):
@@ -195,11 +228,14 @@ def user_owns_job(job: Job, user_id: int) -> bool:
 
 
 async def send_with_optional_reply(send_callable, *, reply_to_message_id: int = 0, **kwargs):
+    # allow_sending_without_reply lets Telegram fall back server-side when the
+    # replied-to message is gone, so a slow upload is never re-sent client-side
+    # (a retry after TimedOut can deliver the file twice).
     if reply_to_message_id > 0:
-        try:
-            return await send_callable(reply_to_message_id=reply_to_message_id, **kwargs)
-        except Exception as exc:
-            logger.info("Retrying send without reply_to_message_id after: %s", exc)
+        kwargs["reply_parameters"] = ReplyParameters(
+            message_id=reply_to_message_id,
+            allow_sending_without_reply=True,
+        )
     return await send_callable(**kwargs)
 
 
@@ -245,6 +281,9 @@ async def send_audio_to_chat(
     filename: str,
     caption: str = "",
     reply_to_message_id: int = 0,
+    read_timeout: int = 300,
+    write_timeout: int = 300,
+    connect_timeout: int = 60,
 ):
     return await send_with_optional_reply(
         bot.send_audio,
@@ -252,6 +291,9 @@ async def send_audio_to_chat(
         audio=audio,
         filename=filename,
         caption=caption,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
+        connect_timeout=connect_timeout,
         reply_to_message_id=reply_to_message_id,
     )
 
@@ -418,6 +460,9 @@ async def send_legacy_delivery_artifact(
             filename=filename,
             caption=caption,
             reply_to_message_id=reply_to_message_id,
+            read_timeout=600,
+            write_timeout=600,
+            connect_timeout=60,
         )
 
 
@@ -568,62 +613,6 @@ def get_delivery_feedback_job(context: ContextTypes.DEFAULT_TYPE) -> Job | None:
         return None
 
 
-async def handoff_group_request(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    request_kind: str,
-    request_payload: dict[str, object],
-):
-    message = update.message
-    if message is None or update.effective_user is None or update.effective_chat is None:
-        return
-    run_storage_maintenance()
-    token = job_manager.create_group_request(
-        group_chat_id=update.effective_chat.id,
-        group_message_id=message.message_id,
-        user_id=update.effective_user.id,
-        request_kind=request_kind,
-        payload=request_payload,
-    )
-    me = await context.bot.get_me()
-    deep_link = f"https://t.me/{me.username}?start=group_{token}"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("׳”׳׳©׳ ׳‘׳₪׳¨׳˜׳™", url=deep_link)]])
-    await message.reply_text(
-        "׳›׳“׳™ ׳©׳׳ ׳׳”׳¢׳׳™׳¡ ׳¢׳ ׳”׳§׳‘׳•׳¦׳”, ׳”׳׳©׳š ׳׳× ׳”׳‘׳§׳©׳” ׳‘׳¦׳׳˜ ׳₪׳¨׳˜׳™ ׳¢׳ ׳”׳‘׳•׳˜. "
-        "׳¨׳§ ׳׳×׳” ׳×׳¨׳׳” ׳׳× ׳›׳ ׳”׳©׳׳‘׳™׳, ׳•׳׳ª ׳”׳×׳•׳¦׳׳” ׳”׳¡׳•׳₪׳™׳× ׳׳©׳׳— ׳₪׳” ׳׳§׳‘׳•׳¦׳”.",
-        reply_markup=keyboard,
-    )
-
-
-async def begin_song_request(message, context: ContextTypes.DEFAULT_TYPE, text: str, delivery_context: dict[str, int] | None = None):
-    normalized = text.strip()
-    if is_youtube_url(normalized):
-        context.user_data["chosen"] = apply_delivery_context({"url": normalized, "title": normalized}, delivery_context)
-        await message.reply_text("׳–׳•׳”׳” ׳§׳™׳©׳•׳¨ ׳׳™׳•׳˜׳™׳•׳‘. ׳‘׳׳™׳–׳” ׳₪׳•׳¨׳׳˜ ׳׳¢׳‘׳•׳“?", reply_markup=build_format_keyboard())
-        return
-
-    status_msg = await message.reply_text(f"׳׳—׳₪׳©: {normalized}...")
-    try:
-        results = await asyncio.get_running_loop().run_in_executor(None, search_youtube, normalized)
-        if not results:
-            await status_msg.edit_text("׳׳ ׳ ׳׳¦׳׳• ׳×׳•׳¦׳׳•׳×." + COMMANDS_TEXT)
-            return
-        context.user_data["search_results"] = [apply_delivery_context(result, delivery_context) for result in results]
-        await status_msg.delete()
-        await message.reply_text(f"׳×׳•׳¦׳׳•׳× ׳¢׳‘׳•׳¨: {normalized}")
-        for index, result in enumerate(results):
-            caption = f"{index + 1}. {result['title'][:60]}\n{result['channel']}\n{result['duration']}"
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("׳‘׳—׳¨", callback_data=f"select:{index}")]])
-            try:
-                await message.reply_photo(result["thumbnail"], caption=caption, reply_markup=keyboard)
-            except Exception:
-                await message.reply_text(caption, reply_markup=keyboard)
-    except Exception as exc:
-        logger.error("Search error: %s", exc)
-        await status_msg.edit_text(build_unexpected_error(str(exc)) + COMMANDS_TEXT)
-
-
 def extract_upload_request_payload(message) -> dict[str, object] | None:
     if message.audio:
         return {"file_id": message.audio.file_id, "input_type": "audio_file", "file_name": message.audio.file_name or "audio.mp3"}
@@ -644,244 +633,6 @@ def extract_upload_request_payload(message) -> dict[str, object] | None:
             return None
         return {"file_id": message.document.file_id, "input_type": input_type, "file_name": file_name}
     return None
-
-
-async def prepare_uploaded_choice_from_payload(
-    message,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    user_id: int,
-    upload_payload: dict[str, object],
-    delivery_context: dict[str, int] | None = None,
-):
-    file_name = str(upload_payload.get("file_name") or "file")
-    input_type = str(upload_payload.get("input_type") or "audio_file")
-    file_id = str(upload_payload.get("file_id") or "")
-    if not file_id:
-        await message.reply_text("׳׳ ׳ ׳׳¦׳ ׳§׳•׳‘׳¥ ׳×׳§׳™׳Ÿ ׳׳¢׳™׳‘׳•׳“." + COMMANDS_TEXT)
-        return
-
-    status_msg = await message.reply_text(f"׳׳•׳¨׳™׳“ ׳׳× ׳”׳§׳•׳‘׳¥: {file_name}...")
-    try:
-        tg_file = await context.bot.get_file(file_id)
-        run_storage_maintenance()
-        delivery_chat_id, delivery_reply_to_message_id = get_delivery_target(delivery_context, message.chat_id)
-        job = job_manager.create_job(
-            title=Path(file_name).stem,
-            input_type=input_type,
-            has_video=(input_type == "video_file"),
-            chat_id=message.chat_id,
-            user_id=user_id,
-            delivery_chat_id=delivery_chat_id,
-            delivery_reply_to_message_id=delivery_reply_to_message_id,
-        )
-        ext = Path(file_name).suffix or (".mp3" if input_type == "audio_file" else ".mp4")
-        local_path = str(job.job_dir / f"uploaded{ext}")
-        await tg_file.download_to_drive(local_path)
-        context.user_data["uploaded_job"] = job
-        context.user_data["chosen"] = apply_delivery_context(
-            {
-                "title": Path(file_name).stem,
-                "input_type": input_type,
-                "local_path": local_path,
-            },
-            delivery_context,
-        )
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("׳׳§׳•׳¨׳“׳™׳ + ׳׳™׳׳™׳", callback_data="format:chords")],
-                [InlineKeyboardButton("׳§׳¨׳™׳•׳§׳™ ׳•׳™׳“׳™׳׳•", callback_data="format:hebrew_karaoke")],
-            ]
-        )
-        await status_msg.edit_text(f"׳”׳§׳•׳‘׳¥ ׳ ׳˜׳¢׳: {file_name}\n׳׳” ׳׳¢׳©׳•׳×?", reply_markup=keyboard)
-    except Exception as exc:
-        logger.error("File upload error: %s\n%s", exc, traceback.format_exc())
-        await status_msg.edit_text(build_unexpected_error(str(exc)) + COMMANDS_TEXT)
-
-
-async def resume_group_request_from_start(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> bool:
-    if update.effective_user is None or update.message is None:
-        return False
-    request, error = job_manager.claim_group_request(token, update.effective_user.id)
-    if error == "forbidden":
-        await update.message.reply_text("׳”׳§׳™׳©׳•׳¨ ׳”׳–׳” ׳©׳™׳™׳ ׳׳׳™ ׳©׳‘׳™׳§׳© ׳׳× ׳”׳¢׳™׳‘׳•׳“ ׳‘׳§׳‘׳•׳¦׳”.")
-        return True
-    if error == "missing" or request is None:
-        await update.message.reply_text("׳”׳‘׳§׳©׳” ׳”׳–׳׳ª ׳›׳‘׳¨ ׳ ׳•׳¦׳׳” ׳׳• ׳₪׳’׳”.")
-        return True
-
-    delivery_context = build_delivery_context(
-        int(request.get("group_chat_id", 0) or 0),
-        int(request.get("group_message_id", 0) or 0),
-    )
-    payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
-    request_kind = str(request.get("request_kind") or "")
-    if request_kind == "text":
-        request_text = str(payload.get("text") or "").strip()
-        if not request_text:
-            await update.message.reply_text("׳׳ ׳ ׳׳¦׳ ׳˜׳§׳¡׳˜ ׳׳”׳׳©׳.")
-            return True
-        await begin_song_request(update.message, context, request_text, delivery_context=delivery_context)
-        return True
-    if request_kind == "upload":
-        await prepare_uploaded_choice_from_payload(
-            update.message,
-            context,
-            user_id=update.effective_user.id,
-            upload_payload=payload,
-            delivery_context=delivery_context,
-        )
-        return True
-
-    await update.message.reply_text("׳׳ ׳”׳¦׳׳—׳×׳™ ׳׳©׳—׳–׳¨ ׳׳× ׳”׳‘׳§׳©׳” ׳”׳–׳׳ª.")
-    return True
-
-
-async def handoff_group_request(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    request_kind: str,
-    request_payload: dict[str, object],
-):
-    message = update.message
-    if message is None or update.effective_user is None or update.effective_chat is None:
-        return
-    run_storage_maintenance()
-    token = job_manager.create_group_request(
-        group_chat_id=update.effective_chat.id,
-        group_message_id=message.message_id,
-        user_id=update.effective_user.id,
-        request_kind=request_kind,
-        payload=request_payload,
-    )
-    me = await context.bot.get_me()
-    deep_link = f"https://t.me/{me.username}?start=group_{token}"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("המשך בפרטי", url=deep_link)]])
-    await message.reply_text(
-        "כדי שלא להעמיס על הקבוצה, המשך את הבקשה בצ'אט פרטי עם הבוט. "
-        "רק אתה תראה את כל השלבים, ואת התוצאה הסופית אשלח פה לקבוצה.",
-        reply_markup=keyboard,
-    )
-
-
-async def begin_song_request(message, context: ContextTypes.DEFAULT_TYPE, text: str, delivery_context: dict[str, int] | None = None):
-    normalized = text.strip()
-    if is_youtube_url(normalized):
-        context.user_data["chosen"] = apply_delivery_context({"url": normalized, "title": normalized}, delivery_context)
-        await message.reply_text("זוהה קישור מיוטיוב. באיזה פורמט לעבוד?", reply_markup=build_format_keyboard())
-        return
-
-    status_msg = await message.reply_text(f"מחפש: {normalized}...")
-    try:
-        results = await asyncio.get_running_loop().run_in_executor(None, search_youtube, normalized)
-        if not results:
-            await status_msg.edit_text("לא נמצאו תוצאות." + COMMANDS_TEXT)
-            return
-        context.user_data["search_results"] = [apply_delivery_context(result, delivery_context) for result in results]
-        await status_msg.delete()
-        await message.reply_text(f"תוצאות עבור: {normalized}")
-        for index, result in enumerate(results):
-            caption = f"{index + 1}. {result['title'][:60]}\n{result['channel']}\n{result['duration']}"
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("בחר", callback_data=f"select:{index}")]])
-            try:
-                await message.reply_photo(result["thumbnail"], caption=caption, reply_markup=keyboard)
-            except Exception:
-                await message.reply_text(caption, reply_markup=keyboard)
-    except Exception as exc:
-        logger.error("Search error: %s", exc)
-        await status_msg.edit_text(build_unexpected_error(str(exc)) + COMMANDS_TEXT)
-
-
-async def prepare_uploaded_choice_from_payload(
-    message,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    user_id: int,
-    upload_payload: dict[str, object],
-    delivery_context: dict[str, int] | None = None,
-):
-    file_name = str(upload_payload.get("file_name") or "file")
-    input_type = str(upload_payload.get("input_type") or "audio_file")
-    file_id = str(upload_payload.get("file_id") or "")
-    if not file_id:
-        await message.reply_text("לא נמצא קובץ תקין לעיבוד." + COMMANDS_TEXT)
-        return
-
-    status_msg = await message.reply_text(f"מוריד את הקובץ: {file_name}...")
-    try:
-        tg_file = await context.bot.get_file(file_id)
-        run_storage_maintenance()
-        delivery_chat_id, delivery_reply_to_message_id = get_delivery_target(delivery_context, message.chat_id)
-        job = job_manager.create_job(
-            title=Path(file_name).stem,
-            input_type=input_type,
-            has_video=(input_type == "video_file"),
-            chat_id=message.chat_id,
-            user_id=user_id,
-            delivery_chat_id=delivery_chat_id,
-            delivery_reply_to_message_id=delivery_reply_to_message_id,
-        )
-        ext = Path(file_name).suffix or (".mp3" if input_type == "audio_file" else ".mp4")
-        local_path = str(job.job_dir / f"uploaded{ext}")
-        await tg_file.download_to_drive(local_path)
-        context.user_data["uploaded_job"] = job
-        context.user_data["chosen"] = apply_delivery_context(
-            {
-                "title": Path(file_name).stem,
-                "input_type": input_type,
-                "local_path": local_path,
-            },
-            delivery_context,
-        )
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("אקורדים + מילים", callback_data="format:chords")],
-                [InlineKeyboardButton("קריוקי וידאו", callback_data="format:hebrew_karaoke")],
-            ]
-        )
-        await status_msg.edit_text(f"הקובץ נטען: {file_name}\nמה לעשות?", reply_markup=keyboard)
-    except Exception as exc:
-        logger.error("File upload error: %s\n%s", exc, traceback.format_exc())
-        await status_msg.edit_text(build_unexpected_error(str(exc)) + COMMANDS_TEXT)
-
-
-async def resume_group_request_from_start(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> bool:
-    if update.effective_user is None or update.message is None:
-        return False
-    request, error = job_manager.claim_group_request(token, update.effective_user.id)
-    if error == "forbidden":
-        await update.message.reply_text("הקישור הזה שייך למי שביקש את העיבוד בקבוצה.")
-        return True
-    if error == "missing" or request is None:
-        await update.message.reply_text("הבקשה הזאת כבר נוצלה או פגה.")
-        return True
-
-    delivery_context = build_delivery_context(
-        int(request.get("group_chat_id", 0) or 0),
-        int(request.get("group_message_id", 0) or 0),
-    )
-    payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
-    request_kind = str(request.get("request_kind") or "")
-    if request_kind == "text":
-        request_text = str(payload.get("text") or "").strip()
-        if not request_text:
-            await update.message.reply_text("לא נמצא טקסט להמשך.")
-            return True
-        await begin_song_request(update.message, context, request_text, delivery_context=delivery_context)
-        return True
-    if request_kind == "upload":
-        await prepare_uploaded_choice_from_payload(
-            update.message,
-            context,
-            user_id=update.effective_user.id,
-            upload_payload=payload,
-            delivery_context=delivery_context,
-        )
-        return True
-
-    await update.message.reply_text("לא הצלחתי לשחזר את הבקשה הזאת.")
-    return True
 
 
 def _build_review_text(job: Job, note: str | None = None) -> str:
@@ -1489,12 +1240,8 @@ async def save_delivery_feedback_text(message, context: ContextTypes.DEFAULT_TYP
         chat_id=message.chat_id,
     )
     context.user_data.pop("delivery_feedback_job_id", None)
-    await repair_delivery_feedback_and_preview(message, context, job, cleaned_text)
-    return
-    await message.reply_text(
-        "שמרתי את ההערות שלך בלוג התיקונים, ולא פרסמתי את התוצאה לקבוצה. "
-        "נוכל להשתמש בזה כדי לשפר את ההפקה הבאה."
-    )
+    async with heavy_job_slot(message):
+        await repair_delivery_feedback_and_preview(message, context, job, cleaned_text)
 
 
 async def handle_delivery_feedback_file(update: Update, context: ContextTypes.DEFAULT_TYPE, job: Job):
@@ -2060,32 +1807,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await begin_song_request(update.message, context, text)
-    return
-
-    if is_youtube_url(text):
-        context.user_data["chosen"] = {"url": text, "title": text}
-        await update.message.reply_text("זוהה קישור מיוטיוב. באיזה פורמט לעבוד?", reply_markup=build_format_keyboard())
-        return
-
-    status_msg = await update.message.reply_text(f"מחפש: {text}...")
-    try:
-        results = await asyncio.get_running_loop().run_in_executor(None, search_youtube, text)
-        if not results:
-            await status_msg.edit_text("לא נמצאו תוצאות." + COMMANDS_TEXT)
-            return
-        context.user_data["search_results"] = results
-        await status_msg.delete()
-        await update.message.reply_text(f"תוצאות עבור: {text}")
-        for index, result in enumerate(results):
-            caption = f"{index + 1}. {result['title'][:60]}\n{result['channel']}\n{result['duration']}"
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("בחר", callback_data=f"select:{index}")]])
-            try:
-                await update.message.reply_photo(result["thumbnail"], caption=caption, reply_markup=keyboard)
-            except Exception:
-                await update.message.reply_text(caption, reply_markup=keyboard)
-    except Exception as exc:
-        logger.error("Search error: %s", exc)
-        await status_msg.edit_text(build_unexpected_error(str(exc)) + COMMANDS_TEXT)
 
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2220,8 +1941,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if protected_job_id:
         try:
             protected_job = job_manager.load_job(protected_job_id)
-        except FileNotFoundError:
-            await query.answer("הבקשה כבר לא זמינה.", show_alert=True)
+        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            # The job folder was cleaned up (or its manifest is corrupt) —
+            # e.g. the button belongs to a project the daily reset removed.
+            await query.answer("הפרויקט הזה כבר נמחק. שלח את השיר מחדש כדי להתחיל.", show_alert=True)
             return
         if not user_owns_job(protected_job, update.effective_user.id):
             await query.answer("רק המשתמש שפתח את הבקשה יכול להמשיך.", show_alert=True)
@@ -2323,12 +2046,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
             await edit_or_reply(query.message, "מתחיל עיבוד קריוקי עברי...")
-            await run_karaoke_until_review(query.message, context)
+            async with heavy_job_slot(query.message):
+                await run_karaoke_until_review(query.message, context)
             return
 
         if fmt == "chords":
             await edit_or_reply(query.message, "מכין אקורדים + מילים...")
-            await generate_direct_chords_output(query.message, context)
+            async with heavy_job_slot(query.message):
+                await generate_direct_chords_output(query.message, context)
             return
 
         url = chosen.get("url", "")
@@ -2336,7 +2061,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if fmt == "mp3":
                 await edit_or_reply(query.message, "מוריד MP3...")
-                mp3_path, title = await asyncio.get_running_loop().run_in_executor(None, download_audio, url)
+                mp3_path, title = await run_heavy_in_executor(query.message, download_audio, url)
                 if requires_group_delivery_approval(query.message.chat_id, delivery_chat_id):
                     run_storage_maintenance()
                     legacy_job = job_manager.create_job(
@@ -2386,7 +2111,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             elif fmt == "karaoke":
                 await edit_or_reply(query.message, "מכין פלייבק ללא ווקאל...")
-                karaoke_path, title = await asyncio.get_running_loop().run_in_executor(None, download_audio_karaoke, url)
+                karaoke_path, title = await run_heavy_in_executor(query.message, download_audio_karaoke, url)
                 if requires_group_delivery_approval(query.message.chat_id, delivery_chat_id):
                     run_storage_maintenance()
                     legacy_job = job_manager.create_job(
@@ -2437,7 +2162,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif fmt == "video":
                 quality = parts[2] if len(parts) > 2 else "best"
                 await edit_or_reply(query.message, f"מוריד וידאו {quality}...")
-                video_path, title = await asyncio.get_running_loop().run_in_executor(None, download_video, url, quality)
+                video_path, title = await run_heavy_in_executor(query.message, download_video, url, quality)
                 if requires_group_delivery_approval(query.message.chat_id, delivery_chat_id):
                     run_storage_maintenance()
                     legacy_job = job_manager.create_job(
@@ -2522,7 +2247,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             context.user_data["reuse_job_id"] = job.job_id
             await edit_or_reply(query.message, f"ממשיך מהעיבוד הקיים עבור:\n{job.display_name}")
-            await run_karaoke_until_review(query.message, context)
+            async with heavy_job_slot(query.message):
+                await run_karaoke_until_review(query.message, context)
             return
 
         if action == "rerender":
@@ -2543,19 +2269,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 note="רינדור מחדש: בודקים ועורכים את המילים לפני היצוא.",
             )
             return
-            await show_review_text(query.message, job, note="׳¨׳™׳ ׳“׳•׳¨ ׳׳—׳“׳©: ׳׳׳“׳§׳™׳ ׳׳¢׳׳¨׳›׳™׳ ׳׳× ׳”׳׳™׳׳™׳ ׳׳₪׳ ׳™ ׳”׳™׳¦׳•׳.")
-            return
-            await edit_or_reply(
-                query.message,
-                f"רינדור מחדש עבור:\n{job.display_name}\n\nמה לייצר עכשיו?",
-                reply_markup=build_output_keyboard(job.job_id),
-            )
-            return
 
         context.user_data.pop(f"output_mode:{job.job_id}", None)
         context.user_data.pop("reuse_job_id", None)
         await edit_or_reply(query.message, "מתחיל עיבוד חדש...")
-        await run_karaoke_until_review(query.message, context)
+        async with heavy_job_slot(query.message):
+            await run_karaoke_until_review(query.message, context)
         return
 
     if data.startswith("karaoke_option:"):
@@ -2613,10 +2332,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job = job_manager.load_job(job_id)
         if choice == "chords_text":
             context.user_data[f"delivery_mode:{job_id}"] = "chords_text"
-            await generate_karaoke_output(query, context, job, None)
+            async with heavy_job_slot(query.message):
+                await generate_karaoke_output(query, context, job, None)
         elif choice == "subs_only":
             context.user_data[f"delivery_mode:{job_id}"] = "default"
-            await generate_karaoke_output(query, context, job, None)
+            async with heavy_job_slot(query.message):
+                await generate_karaoke_output(query, context, job, None)
         else:
             context.user_data[f"delivery_mode:{job_id}"] = "default"
             if choice == "video_vocals":
@@ -2633,7 +2354,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, job_id, quality = data.split(":")
         video_req = context.user_data.get(f"video_request:{job_id}") or VideoRequest(with_vocals=True, without_vocals=True)
         video_req.quality = quality
-        await generate_karaoke_output(query, context, job_manager.load_job(job_id), video_req)
+        async with heavy_job_slot(query.message):
+            await generate_karaoke_output(query, context, job_manager.load_job(job_id), video_req)
 
 
 def group_request_needs_manual_claim(message) -> bool:
@@ -2830,11 +2552,24 @@ def main():
         ensure_single_instance()
     except RuntimeError as exc:
         logger.error("%s", exc)
-        print("׳›׳‘׳¨ ׳¨׳¥ ׳׳•׳₪׳¢ ׳׳—׳¨ ׳©׳ ׳”׳‘׳•׳˜ ׳‘׳₪׳¨׳•׳™׳§׳˜ ׳”׳–׳”.")
+        print("כבר רץ מופע אחר של הבוט בפרויקט הזה.")
         return
 
     run_storage_maintenance()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)
+        # Global request timeouts: large karaoke MP3/MP4 uploads exceed the
+        # ~20s library default and used to die with httpx.WriteTimeout.
+        # get_updates_* (long polling) intentionally keeps its own defaults.
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(120)
+        .pool_timeout(30)
+        .media_write_timeout(600)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("stop", stop))

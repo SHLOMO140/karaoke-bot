@@ -136,10 +136,26 @@ def is_cleanup_candidate(
         if last_activity <= cutoff:
             return "error"
 
+    if job.status == JobStatus.DONE and job.review_status == ReviewStatus.APPROVED:
+        cutoff = current_time - timedelta(hours=stale_after_hours)
+        if last_activity <= cutoff:
+            return "approved_undelivered"
+
+    if job.status == JobStatus.AWAITING_REVIEW:
+        cutoff = current_time - timedelta(hours=stale_after_hours)
+        if last_activity <= cutoff:
+            return "abandoned_review"
+
     if job.status in _PROCESSING_STATUSES:
         cutoff = current_time - timedelta(hours=stale_after_hours)
         if last_activity <= cutoff:
             return "stale"
+
+    # Safety net: reclaim any job no rule above matched after a week,
+    # so no status combination can accumulate forever.
+    cutoff = current_time - timedelta(hours=max(stale_after_hours, 168))
+    if last_activity <= cutoff:
+        return "expired"
 
     return None
 

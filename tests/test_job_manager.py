@@ -1026,6 +1026,11 @@ def test_find_latest_reusable_job_prefers_newest_matching_source(tmp_path, monke
     newer.ass_path.write_text("new", encoding="utf-8")
     job_manager.save_job(older)
     job_manager.save_job(newer)
+    # Deterministic ordering: back-to-back saves can land on the same timestamp.
+    older.manifest.updated_at = "2026-01-01T00:00:00+00:00"
+    newer.manifest.updated_at = "2026-01-02T00:00:00+00:00"
+    job_manager._write_json(older.manifest_path, asdict(older.manifest))
+    job_manager._write_json(newer.manifest_path, asdict(newer.manifest))
 
     found = job_manager.find_latest_reusable_job(
         source_url="https://youtube.com/watch?v=1",
@@ -1087,10 +1092,11 @@ def test_cleanup_stale_jobs_removes_completed_and_stuck_jobs(tmp_path, monkeypat
     assert {(item["job_id"], item["reason"]) for item in removed} == {
         (completed.job_id, "completed"),
         (failed.job_id, "error"),
+        (review.job_id, "abandoned_review"),
     }
     assert not (tmp_path / completed.job_id).exists()
     assert not (tmp_path / failed.job_id).exists()
-    assert (tmp_path / review.job_id).exists()
+    assert not (tmp_path / review.job_id).exists()
 
 
 def test_is_cleanup_candidate_keeps_recent_review_job(tmp_path, monkeypatch):
@@ -1105,6 +1111,40 @@ def test_is_cleanup_candidate_keeps_recent_review_job(tmp_path, monkeypatch):
     reason = job_manager.is_cleanup_candidate(job, now=now, completed_after_hours=24, stale_after_hours=72)
 
     assert reason is None
+
+
+def test_is_cleanup_candidate_reclaims_approved_undelivered(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_manager, "JOBS_DIR", tmp_path)
+    now = datetime(2026, 4, 5, tzinfo=timezone.utc)
+    job = job_manager.create_job(title="approved", input_type="audio_file")
+    job_manager.update_status(job, JobStatus.DONE)
+    job_manager.update_review_status(job, ReviewStatus.APPROVED)
+
+    job.manifest.updated_at = (now - timedelta(hours=10)).isoformat()
+    job_manager._write_json(job.manifest_path, asdict(job.manifest))
+    assert job_manager.is_cleanup_candidate(job, now=now, completed_after_hours=24, stale_after_hours=72) is None
+
+    job.manifest.updated_at = (now - timedelta(hours=96)).isoformat()
+    job_manager._write_json(job.manifest_path, asdict(job.manifest))
+    reason = job_manager.is_cleanup_candidate(job, now=now, completed_after_hours=24, stale_after_hours=72)
+    assert reason == "approved_undelivered"
+
+
+def test_is_cleanup_candidate_expires_unmatched_statuses(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_manager, "JOBS_DIR", tmp_path)
+    now = datetime(2026, 4, 5, tzinfo=timezone.utc)
+    job = job_manager.create_job(title="odd", input_type="audio_file")
+    job_manager.update_status(job, JobStatus.DONE)
+    job_manager.update_review_status(job, ReviewStatus.DRAFT_READY)
+
+    job.manifest.updated_at = (now - timedelta(hours=100)).isoformat()
+    job_manager._write_json(job.manifest_path, asdict(job.manifest))
+    assert job_manager.is_cleanup_candidate(job, now=now, completed_after_hours=24, stale_after_hours=72) is None
+
+    job.manifest.updated_at = (now - timedelta(hours=200)).isoformat()
+    job_manager._write_json(job.manifest_path, asdict(job.manifest))
+    reason = job_manager.is_cleanup_candidate(job, now=now, completed_after_hours=24, stale_after_hours=72)
+    assert reason == "expired"
 
 
 def test_song_analysis_roundtrip(tmp_path, monkeypatch):
