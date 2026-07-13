@@ -1,5 +1,5 @@
 from karaoke.chord_sources import lookup_external_chord_sheet, lookup_external_chord_sheet_by_title
-from karaoke.lyrics_verifier import SearchResult
+from karaoke.web_search import SearchResult
 from karaoke.models import TranscriptSegment, WordTiming
 
 
