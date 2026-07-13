@@ -21,14 +21,18 @@
 | `SUPABASE_URL` | כתובת ה-Supabase של פרויקט Lovable (Supabase → Settings → API → Project URL) |
 | `SUPABASE_SERVICE_ROLE_KEY` | מפתח `service_role` (Supabase → Settings → API). מפתח-על — סוד! |
 | `PUBLIC_BASE_URL` | כתובת ה-Space, למשל `https://<user>-<space>.hf.space` |
-| `YTDLP_COOKIE_FILE` | `/app/cookies.txt` (ראה סעיף 3) |
+| `YTDLP_COOKIES_CONTENT` | **כל התוכן** של קובץ `cookies.txt` (הדבק כטקסט — ראה סעיף 3) |
+
+⚠️ ה-Space ציבורי (הכרחי כדי שקישורי ההורדה והפינג יעבדו בלי התחברות). לכן
+**אסור** להעלות את `cookies.txt` כקובץ — מדביקים את תוכנו כ-Secret בשם `YTDLP_COOKIES_CONTENT`,
+והקוד כותב אותו לקובץ זמני בהפעלה.
 
 ## 3. Cookies של יוטיוב (חובה כדי לעקוף חסימת IP של הענן)
 
 1. ייצא `cookies.txt` בפורמט Netscape מדפדפן מחובר ליוטיוב (עדיף חשבון משני).
-2. העלה אותו כ-**secret file** ב-Space בשם `cookies.txt` (או הוסף לריפו — הוא ב-gitignore
-   מקומית, אז ב-Space העלה אותו ידנית ל-`/app/cookies.txt`).
-3. ודא ש-`YTDLP_COOKIE_FILE=/app/cookies.txt`.
+2. פתח את הקובץ, העתק את **כל התוכן**, והדבק אותו כ-Secret בשם `YTDLP_COOKIES_CONTENT`
+   (Space → Settings → Variables and secrets → New secret).
+3. הקוד כותב אותו אוטומטית לקובץ זמני בהפעלה — אין צורך בקובץ בריפו.
 
 ## 4. פינג שמונע שינה (חינם, בלי כרטיס)
 

@@ -43,11 +43,29 @@ YTDLP_COOKIES_FROM_BROWSER: str = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "")
 _DEFAULT_COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 
+def _materialized_cookie_file() -> str:
+    """On a public host, cookies are passed via the YTDLP_COOKIES_CONTENT secret
+    (env var) instead of a committed file; write it to a runtime file once."""
+    content = os.getenv("YTDLP_COOKIES_CONTENT", "")
+    if not content.strip():
+        return ""
+    target = RUNTIME_DIR / "cookies.txt"
+    try:
+        if not target.exists() or target.read_text(encoding="utf-8") != content:
+            target.write_text(content, encoding="utf-8")
+        return str(target)
+    except OSError:
+        return ""
+
+
 def ytdlp_base_opts() -> dict:
     """Return yt-dlp options for bypassing YouTube bot detection."""
     opts: dict = {"js_runtimes": {"node": {}}, "remote_components": ["ejs:github"]}
+    materialized = _materialized_cookie_file()
     if YTDLP_COOKIE_FILE:
         opts["cookiefile"] = YTDLP_COOKIE_FILE
+    elif materialized:
+        opts["cookiefile"] = materialized
     elif _DEFAULT_COOKIE_FILE.exists():
         opts["cookiefile"] = str(_DEFAULT_COOKIE_FILE)
     elif YTDLP_COOKIES_FROM_BROWSER:
