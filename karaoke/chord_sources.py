@@ -887,6 +887,9 @@ def lookup_external_chord_sheet_by_title(
         best_score,
     )
 
+    # Stash the parsed sheet so callers can re-render in the original key
+    # (semitones=0) or the easy key, and build inline [Chord] library content.
+    analysis.parsed_sheet = best_sheet
     return analysis
 
 
