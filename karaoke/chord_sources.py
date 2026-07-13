@@ -17,7 +17,7 @@ from .harmony import (
     resolve_song_analysis_key_labels,
     transpose_chord_label,
 )
-from .lyrics_verifier import (
+from .web_search import (
     SearchResult,
     _build_query_variants,
     _evaluate_candidate_text_against_draft,
