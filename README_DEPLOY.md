@@ -1,18 +1,15 @@
-# פריסה חינמית 24/7 — Hugging Face Spaces
+# פריסה חינמית 24/7 — Hugging Face Spaces (Gradio SDK, בלי כרטיס)
 
-הבוט רץ כתהליך Python יחיד: long-polling של טלגרם + שרת aiohttp על פורט 7860
-(דף בריאות + קישורי הורדה לווידאו גדול). הספרייה נשארת ב-Lovable/Supabase.
+הבוט רץ ב-thread רקע (long-polling של טלגרם) לצד דף סטטוס של Gradio על פורט 7860.
+וידאו מעל 50MB מוגש דרך מנגנון `/file=` המובנה של Gradio. הספרייה נשארת ב-Lovable/Supabase.
+(הערה: סוג "Docker" של HF הפך בתשלום — לכן משתמשים ב-Gradio החינמי.)
 
 ## 1. יצירת Space
 
 1. היכנס ל-https://huggingface.co (הרשמה חינם, **בלי כרטיס אשראי**).
-2. **New Space** → SDK: **Docker** → Blank → Private.
-3. דחוף לשם את הקוד (Space הוא ריפו git):
-   ```bash
-   git remote add space https://huggingface.co/spaces/<user>/<space-name>
-   git push space lean-bot-strip:main
-   ```
-   (או חבר את ה-Space ל-GitHub repo דרך ה-UI.)
+2. **New Space** → SDK: **Gradio** → Blank → Private.
+3. העלה את קבצי הבוט: לשונית **Files** → **Add file → Upload files** → גרור את התיקייה
+   הנקייה (`karaoke-deploy`). כוללת `packages.txt` (ffmpeg+nodejs מותקנים אוטומטית).
 
 ## 2. Secrets (ב-Space → Settings → Variables and secrets)
 

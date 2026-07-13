@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from karaoke import chords, library_sync, media
-from karaoke.config import PUBLIC_BASE_URL, TELEGRAM_FILE_LIMIT_BYTES
+from karaoke.config import TELEGRAM_FILE_LIMIT_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -274,10 +274,10 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         finally:
             _safe_remove(path)
     else:
-        registry = context.bot_data["registry"]
-        token = registry.register(path)
-        base = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else ""
-        link = f"{base}/d/{token}" if base else f"/d/{token} (PUBLIC_BASE_URL לא הוגדר)"
+        # File stays on disk to be served by the link; a periodic sweep (in the
+        # entrypoint) removes it after it expires.
+        link_builder = context.bot_data.get("link_builder")
+        link = link_builder(path) if link_builder else path
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"הקובץ גדול מ-50MB. קישור הורדה (בתוקף לשעתיים):\n{link}",
@@ -311,8 +311,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
-def register_handlers(application: Application, registry) -> None:
-    application.bot_data["registry"] = registry
+def register_handlers(application: Application, link_builder=None) -> None:
+    """link_builder(path)->url makes a large local file downloadable and returns its URL."""
+    application.bot_data["link_builder"] = link_builder
     application.add_error_handler(on_error)
     application.add_handler(CommandHandler("start", on_start))
     application.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
