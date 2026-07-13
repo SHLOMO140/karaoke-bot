@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import yt_dlp
@@ -67,9 +68,18 @@ def _extract_info(url: str) -> dict:
 
 
 def _stage_path(prefix: str) -> Path:
-    stage_dir = STAGING_DIR / prefix
+    # Unique per download so concurrent jobs never clobber each other's files.
+    stage_dir = STAGING_DIR / f"{prefix}_{uuid.uuid4().hex}"
     stage_dir.mkdir(parents=True, exist_ok=True)
     return stage_dir
+
+
+def _unique_output(title: str, ext: str) -> Path:
+    # Pretty filename inside a unique subdir so two users (or the same title
+    # twice) never collide on the final path.
+    out_dir = DOWNLOAD_DIR / uuid.uuid4().hex
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"{safe_filename(title)}.{ext}"
 
 
 def _cleanup_stage(stage_dir: Path) -> None:
@@ -134,7 +144,7 @@ def download_audio(url: str) -> tuple[str, str]:
     """Download best audio and transcode to mp3. Returns (mp3_path, title)."""
     info = _extract_info(url)
     title = str(info.get("title") or info.get("id") or "audio")
-    dst = DOWNLOAD_DIR / f"{safe_filename(title)}.mp3"
+    dst = _unique_output(title, "mp3")
     stage_dir = _stage_path("audio")
     try:
         ydl_opts = {
@@ -169,7 +179,7 @@ def download_video(url: str, quality: str) -> tuple[str, str]:
     """Download video at the requested quality, merged to mp4. Returns (mp4_path, title)."""
     info = _extract_info(url)
     title = str(info.get("title") or info.get("id") or "video")
-    dst = DOWNLOAD_DIR / f"{safe_filename(title)}.mp4"
+    dst = _unique_output(title, "mp4")
     stage_dir = _stage_path("video")
     try:
         ydl_opts = {

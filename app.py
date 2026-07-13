@@ -44,7 +44,7 @@ async def main() -> None:
     bot.register_handlers(application, registry)
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
+    await application.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot polling started")
 
     try:

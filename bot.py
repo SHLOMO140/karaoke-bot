@@ -291,13 +291,29 @@ def _safe_remove(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+    # Downloads live in a unique per-job subdir; drop it once emptied.
+    try:
+        os.rmdir(os.path.dirname(path))
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
 # Wiring
 # --------------------------------------------------------------------------- #
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.warning("Handler error: %s", context.error)
+    query = getattr(update, "callback_query", None)
+    try:
+        if query is not None:
+            await query.answer("קרתה שגיאה, נסה שוב.", show_alert=False)
+    except Exception:  # noqa: BLE001 - never let the error handler raise
+        pass
+
+
 def register_handlers(application: Application, registry) -> None:
     application.bot_data["registry"] = registry
+    application.add_error_handler(on_error)
     application.add_handler(CommandHandler("start", on_start))
     application.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     application.add_handler(CallbackQueryHandler(on_chords, pattern=r"^chords:"))
