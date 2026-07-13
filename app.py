@@ -1,10 +1,10 @@
-"""Hugging Face Gradio Space entrypoint (free tier — no Docker).
+"""Hugging Face Space entrypoint (Gradio SDK, but the app itself uses ONLY the
+Python standard-library HTTP server — no gradio import — so it is immune to
+gradio's dependency issues on the Space).
 
-Runs the Telegram bot in a background thread and a tiny Gradio status page on
-port 7860 (the only public port). Large videos that exceed Telegram's 50MB cap
-are served through Gradio's built-in ``/file=`` endpoint (allowed_paths), so no
-separate file server / extra port is needed. A periodic sweep deletes expired
-download files.
+Runs the Telegram bot in a background thread and a tiny HTTP server on port 7860
+for the health check (also the uptime-ping target) and large-video download
+links. A periodic sweep deletes expired download files.
 """
 
 from __future__ import annotations
@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
+import shutil
 import threading
 import time
-from urllib.parse import quote
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import gradio as gr
 from telegram.ext import ApplicationBuilder
 
 import bot
@@ -29,12 +30,30 @@ logging.basicConfig(
 logger = logging.getLogger("app")
 
 DOWNLOAD_ROOT = os.path.abspath(str(DOWNLOAD_DIR))
+PORT = int(os.getenv("PORT", "7860"))
+
+_links: dict[str, tuple[str, float]] = {}
+
+
+def register_link(path: str) -> str:
+    token = secrets.token_urlsafe(16)
+    _links[token] = (path, time.time())
+    return token
+
+
+def resolve_link(token: str) -> str | None:
+    item = _links.get(token)
+    if not item:
+        return None
+    path, ts = item
+    if time.time() - ts > LINK_TTL_SECONDS:
+        _links.pop(token, None)
+        return None
+    return path
 
 
 def _link_builder(path: str) -> str:
-    """URL for a large local file, served by Gradio's /file= endpoint."""
-    base = PUBLIC_BASE_URL.rstrip("/")
-    return f"{base}/file={quote(os.path.abspath(path))}"
+    return f"{PUBLIC_BASE_URL.rstrip('/')}/d/{register_link(path)}"
 
 
 def _sweep_downloads() -> None:
@@ -49,28 +68,62 @@ def _sweep_downloads() -> None:
                 pass
 
 
-def _run_bot() -> None:
-    async def _main() -> None:
-        if not TELEGRAM_BOT_TOKEN:
-            logger.error("No Telegram bot token found; bot not started.")
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        if self.path in ("/", "/health"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
-        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        bot.register_handlers(application, _link_builder)
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        logger.info("Telegram bot polling started")
-        while True:
-            await asyncio.sleep(300)
-            _sweep_downloads()
+        if self.path.startswith("/d/"):
+            token = self.path[3:].split("?", 1)[0]
+            path = resolve_link(token)
+            if path and os.path.exists(path):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{os.path.basename(path)}"',
+                )
+                self.send_header("Content-Length", str(os.path.getsize(path)))
+                self.end_headers()
+                with open(path, "rb") as fh:
+                    shutil.copyfileobj(fh, self.wfile)
+                return
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"expired or not found")
+            return
+        self.send_response(404)
+        self.end_headers()
 
-    asyncio.run(_main())
+    def log_message(self, *_args):  # silence per-request logging
+        return
 
 
-with gr.Blocks(title="Karaoke Bot") as demo:
-    gr.Markdown("# 🎸 הבוט פעיל\nשלח שם שיר או קישור יוטיוב לבוט בטלגרם.")
+def _run_server() -> None:
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+async def _bot_main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("No Telegram bot token found; bot not started.")
+        return
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    bot.register_handlers(application, _link_builder)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    logger.info("Telegram bot polling started")
+    while True:
+        await asyncio.sleep(300)
+        _sweep_downloads()
+
 
 if __name__ == "__main__":
-    # Start the bot in the background, then run the (blocking) Gradio server.
-    threading.Thread(target=_run_bot, daemon=True).start()
-    demo.launch(server_name="0.0.0.0", server_port=7860, allowed_paths=[DOWNLOAD_ROOT])
+    threading.Thread(target=_run_server, daemon=True).start()
+    logger.info("HTTP server listening on 0.0.0.0:%s", PORT)
+    asyncio.run(_bot_main())
