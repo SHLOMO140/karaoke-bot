@@ -138,7 +138,14 @@ def _looks_like_section_heading(text: str) -> bool:
 
 def _parse_tab4u_sheet(page_html: str, source_url: str) -> _ParsedTab4USheet | None:
     match = _TAB4U_CONTENT_PATTERN.search(page_html)
-    if not match:
+    if match:
+        content_html = match.group(1)
+    elif _TAB4U_CELL_PATTERN.search(page_html):
+        # Tab4U layout changes have renamed/dropped the songContentTPL
+        # container before; as long as chords/song cells exist, parse the
+        # whole page instead of silently returning nothing.
+        content_html = page_html
+    else:
         return None
 
     tables: list[list[_ChordRow]] = []
@@ -147,7 +154,7 @@ def _parse_tab4u_sheet(page_html: str, source_url: str) -> _ParsedTab4USheet | N
     chord_labels: list[str] = []
     next_word_index = 0
 
-    for table_html in _TAB4U_TABLE_PATTERN.findall(match.group(1)):
+    for table_html in _TAB4U_TABLE_PATTERN.findall(content_html):
         rows: list[_ChordRow] = []
         pending_chord_row: _ChordRow | None = None
 

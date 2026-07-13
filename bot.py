@@ -1044,6 +1044,7 @@ async def send_chords_text_response(
 
     bpm_text = "לא זוהה"
     analysis = None
+    reliability_notice = ""
     if job.song_analysis_path.exists():
         try:
             analysis = job_manager.load_song_analysis(job)
@@ -1058,13 +1059,17 @@ async def send_chords_text_response(
                     summary.visible_chord_count,
                     summary.has_external_source,
                 )
+                # A labeled uncertain answer beats a silently wrong one: the
+                # user sees the reliability caveat instead of nothing.
+                reliability_notice = "⚠️ זיהוי האקורדים יצא באמינות נמוכה — מומלץ לבדוק מול מקור לפני שימוש."
             if analysis.bpm > 0:
                 bpm_text = f"{analysis.bpm:.2f}"
         except Exception:
             pass
 
     chord_text, analysis = build_delivery_chord_text(job, analysis)
-    prefixed_text = f"אקורדים + מילים עבור: {job.display_name}\nקצב: {bpm_text}\n\n{chord_text}".strip()
+    notice_block = f"{reliability_notice}\n" if reliability_notice else ""
+    prefixed_text = f"{notice_block}אקורדים + מילים עבור: {job.display_name}\nקצב: {bpm_text}\n\n{chord_text}".strip()
     preview_text = (
         format_chord_sheet_for_telegram(prefixed_text)
         if should_format_chord_sheet_for_telegram(prefixed_text)

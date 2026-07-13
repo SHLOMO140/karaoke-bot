@@ -341,6 +341,9 @@ def test_send_chords_text_response_formats_preview_chunks_for_rtl(tmp_path, monk
             original_key="F#",
             target_key="Am",
             transpose_semitones=6,
+            # External source => reliable_for_delivery, so the low-confidence
+            # notice (covered by test_chords_upgrade) stays out of this test.
+            chord_source_name="Tab4U",
             original_chord_events=[
                 ChordEvent("Eb", 0.0, 1.0, root="Eb"),
                 ChordEvent("Fm", 1.0, 2.0, root="F"),

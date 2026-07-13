@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
 from .exceptions import MusicAnalysisError
 from .models import ChordEvent, SongAnalysis, TranscriptSegment
+
+# Harmonic/percussive separation aggressiveness. The analysis input is usually
+# the demucs instrumental stem (already vocal-free), so a second aggressive
+# HPSS pass can strip real harmonic content; 0 disables the pass entirely.
+_HPSS_MARGIN = float(os.getenv("KARAOKE_HARMONY_HPSS_MARGIN", "3.0"))
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,12 @@ CHORD_TEMPLATES = (
 _MIN_MATCH_SCORE = 0.32
 _MIN_CONTRAST = 0.020
 _SMOOTHING_CONFIDENCE = 0.78
+# Viterbi transition prior scale (see _decode_chord_path).
+_TRANSITION_WEIGHT = 4.0
+# Confidence calibration weights (see _collect_chord_candidates).
+_CONFIDENCE_SCORE_WEIGHT = 1.0
+_CONFIDENCE_CONTRAST_WEIGHT = 2.2
+_CONFIDENCE_CORE_WEIGHT = 0.22
 _SMOOTHING_MAX_DURATION = 0.32
 _GAP_FILL_MAX_DURATION = 0.20
 _MAX_CANDIDATES_PER_SEGMENT = 8
@@ -295,6 +307,7 @@ def infer_song_key(chord_events: list[ChordEvent]) -> tuple[str, int | None, str
     best_tonic: int | None = None
     best_mode = ""
 
+    scores_by_key: dict[tuple[int, str], float] = {}
     for tonic in range(12):
         for mode, profile in (("major", MAJOR_KEY_PROFILE), ("minor", MINOR_KEY_PROFILE)):
             total_weight = 0.0
@@ -339,6 +352,7 @@ def infer_song_key(chord_events: list[ChordEvent]) -> tuple[str, int | None, str
                 elif last_interval == 7:
                     score += 0.15
 
+            scores_by_key[(tonic, mode)] = score
             if score > best_score:
                 best_score = score
                 best_tonic = tonic
@@ -346,6 +360,25 @@ def infer_song_key(chord_events: list[ChordEvent]) -> tuple[str, int | None, str
 
     if best_tonic is None:
         return "", None, ""
+
+    # Relative major/minor near-ties: prefer the mode whose tonic triad is
+    # actually played more (Krumhansl profiles alone often confuse Am vs C).
+    counterpart = (
+        ((best_tonic + 9) % 12, "minor") if best_mode == "major" else ((best_tonic + 3) % 12, "major")
+    )
+    counterpart_score = scores_by_key.get(counterpart)
+    if counterpart_score is not None and abs(best_score - counterpart_score) <= 0.05 * max(abs(best_score), 1e-6):
+
+        def _tonic_presence(tonic: int, mode: str) -> float:
+            kinds = {"major", "dominant"} if mode == "major" else {"minor", "diminished", "half_diminished"}
+            return sum(
+                max(event.end - event.start, 0.0)
+                for event in visible_events
+                if _event_pitch_class(event) == tonic and _quality_bucket(event) in kinds
+            )
+
+        if _tonic_presence(*counterpart) > _tonic_presence(best_tonic, best_mode) * 1.15:
+            best_tonic, best_mode = counterpart
 
     key_label = _pitch_to_note(best_tonic)
     if best_mode == "minor":
@@ -622,53 +655,6 @@ def _compute_measure_times(beat_times: list[float], time_signature: int) -> list
 # ---------------------------------------------------------------------------
 # Beat-synchronous chroma extraction + chord classification
 # ---------------------------------------------------------------------------
-
-def _extract_beat_sync_chroma(
-    harmonic_audio: Any, sample_rate: int, beat_frames: list[int], np: Any, librosa: Any
-) -> Any:
-    """Extract chroma features synchronized to beat boundaries.
-
-    Beat-sync chroma averages the chroma energy within each beat,
-    producing one chroma vector per beat — much cleaner than raw frame chroma.
-    """
-    chroma = librosa.feature.chroma_cqt(
-        y=harmonic_audio,
-        sr=sample_rate,
-        hop_length=ANALYSIS_HOP_LENGTH,
-        bins_per_octave=36,
-        n_chroma=12,
-    )
-    if getattr(chroma, "size", 0) == 0:
-        chroma = librosa.feature.chroma_stft(
-            y=harmonic_audio, sr=sample_rate, hop_length=ANALYSIS_HOP_LENGTH
-        )
-    if getattr(chroma, "size", 0) == 0:
-        raise MusicAnalysisError("Chord analysis did not produce chroma features.")
-
-    # Apply median filtering (kernel=5 frames) to smooth noise before sync
-    try:
-        from scipy.ndimage import median_filter
-        chroma = median_filter(chroma, size=(1, 5))
-    except ImportError:
-        # Fallback: simple moving average
-        kernel = 5
-        if chroma.shape[1] > kernel:
-            padded = np.pad(chroma, ((0, 0), (kernel // 2, kernel // 2)), mode="edge")
-            smoothed = np.zeros_like(chroma)
-            for i in range(chroma.shape[1]):
-                smoothed[:, i] = padded[:, i:i + kernel].mean(axis=1)
-            chroma = smoothed
-
-    if beat_frames:
-        try:
-            beat_sync_chroma = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
-        except Exception:
-            beat_sync_chroma = chroma
-    else:
-        beat_sync_chroma = chroma
-
-    return chroma, beat_sync_chroma
-
 
 def _normalize_chroma_columns(chroma: Any, np: Any) -> Any:
     if getattr(chroma, "size", 0) == 0:
@@ -1098,18 +1084,54 @@ def _collect_chord_candidates(
     for index, candidate in enumerate(retained):
         next_score = float(retained[index + 1]["score"]) if index + 1 < len(retained) else float(candidate["score"]) - 0.02
         contrast = float(candidate["score"]) - next_score
+        # Calibrated so a cleanly detected triad lands >= 0.7 and the
+        # 0.35/0.52 delivery thresholds regain meaning (a perfect synthetic
+        # input used to score ~0.55, so every real detection read as "low").
         candidate["confidence"] = max(
             0.0,
             min(
                 1.0,
-                float(candidate["score"]) * 0.74
-                + max(contrast, 0.0) * 1.9
-                + float(candidate.get("core_support", 0.0)) * 0.18
+                float(candidate["score"]) * _CONFIDENCE_SCORE_WEIGHT
+                + max(contrast, 0.0) * _CONFIDENCE_CONTRAST_WEIGHT
+                + float(candidate.get("core_support", 0.0)) * _CONFIDENCE_CORE_WEIGHT
                 - max(0.0, _EXTENSION_MIN_STABLE_SUPPORT - float(candidate.get("extension_support", 0.0))) * 0.16,
             ),
         )
 
     return retained
+
+
+def _template_intervals_for_quality(quality_name: str) -> list[int]:
+    for _suffix, name, base_template, _bias in CHORD_TEMPLATES:
+        if name == quality_name:
+            return [index for index, value in enumerate(base_template) if value >= 0.58]
+    return []
+
+
+def _apply_slash_bass_label(label: str, candidate: dict[str, object], row: dict[str, object], np: Any) -> str:
+    """Emit X/Y inversions when a chord tone other than the root dominates the bass.
+
+    The dedicated 35-260 Hz bass chroma is already computed per segment but was
+    only used as a root-support weight; here it finally names the inversion.
+    """
+    root_index = int(candidate.get("root_index", -1))
+    if root_index < 0 or "/" in label:
+        return label
+    bass_vec = np.asarray(row.get("bass_vec"), dtype=float)
+    if bass_vec.size != 12 or float(np.sum(bass_vec)) <= 1e-6:
+        return label
+    bass_pitch = int(np.argmax(bass_vec))
+    if bass_pitch == root_index:
+        return label
+    intervals = _template_intervals_for_quality(str(candidate.get("quality", "")))
+    chord_tones = {(root_index + interval) % 12 for interval in intervals}
+    if bass_pitch not in chord_tones:
+        return label
+    bass_strength = float(bass_vec[bass_pitch])
+    root_strength = float(bass_vec[root_index])
+    if bass_strength < 0.25 or bass_strength < root_strength * 1.25:
+        return label
+    return f"{label}/{NOTE_NAMES[bass_pitch]}"
 
 
 def _transition_score(left: dict[str, object], right: dict[str, object]) -> float:
@@ -1140,6 +1162,12 @@ def _transition_score(left: dict[str, object], right: dict[str, object]) -> floa
 
 
 def _decode_chord_path(candidate_segments: list[list[dict[str, object]]]) -> list[dict[str, object]]:
+    """Viterbi decode over per-segment chord candidates.
+
+    _TRANSITION_WEIGHT lifts the musical transition prior into the same scale
+    as the emission scores (~0.3-0.6); at the raw 0.004-0.065 values the
+    decoder was effectively emission-only and chord continuity was cosmetic.
+    """
     if not candidate_segments:
         return []
 
@@ -1157,7 +1185,7 @@ def _decode_chord_path(candidate_segments: list[list[dict[str, object]]]) -> lis
                 total = (
                     scores[segment_index - 1][previous_index]
                     + float(current["score"])
-                    + _transition_score(previous, current)
+                    + _transition_score(previous, current) * _TRANSITION_WEIGHT
                 )
                 if total > best_total:
                     best_total = total
@@ -1463,9 +1491,13 @@ class LibrosaHarmonyAnalyzer:
             raise MusicAnalysisError("Loaded analysis audio is empty.")
 
         # Harmonic/percussive separation — use only harmonic for chord detection
-        harmonic_audio = librosa.effects.harmonic(audio, margin=3.0)
+        if _HPSS_MARGIN > 0:
+            harmonic_audio = librosa.effects.harmonic(audio, margin=_HPSS_MARGIN)
+        else:
+            harmonic_audio = audio
 
-        # Beat tracking on the full mix for best tempo accuracy
+        # Beat tracking on the analysis audio (typically the demucs
+        # instrumental stem, not the original full mix)
         try:
             tempo, beat_frames = librosa.beat.beat_track(
                 y=audio, sr=sample_rate, hop_length=ANALYSIS_HOP_LENGTH,
@@ -1538,9 +1570,12 @@ class LibrosaHarmonyAnalyzer:
 
         events: list[ChordEvent] = []
         for candidate, row in zip(decoded_path, segment_rows):
+            label = str(candidate["label"])
+            if label != NO_CHORD_LABEL:
+                label = _apply_slash_bass_label(label, candidate, row, np)
             events.append(
                 ChordEvent(
-                    label=str(candidate["label"]),
+                    label=label,
                     start=float(row["start_time"]),
                     end=float(row["end_time"]),
                     confidence=float(candidate["confidence"]),
