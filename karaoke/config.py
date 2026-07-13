@@ -37,6 +37,8 @@ TMP_DIR = RUNTIME_DIR / "tmp"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 YTDLP_STAGING_DIR = RUNTIME_DIR / "yt_dlp"
 YTDLP_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR = Path(os.getenv("KARAOKE_DOWNLOAD_DIR", "downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # yt-dlp YouTube bot-detection bypass.
 # Uses node.js + EJS challenge solver by default.
