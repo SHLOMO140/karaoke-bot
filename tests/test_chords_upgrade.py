@@ -100,6 +100,48 @@ def test_slash_label_applied_when_bass_dominates():
     assert _apply_slash_bass_label("C", candidate, {"bass_vec": bass_foreign}, np) == "C"
 
 
+def _viterbi_candidate(label, score, root_index, quality="major", family="major"):
+    return {
+        "label": label,
+        "root": label[0] if label != "N" else "",
+        "root_index": root_index,
+        "quality": quality if label != "N" else "",
+        "family": family if label != "N" else "",
+        "score": score,
+        "confidence": 0.5,
+    }
+
+
+def test_viterbi_does_not_freeze_on_stale_chord():
+    """Review finding: at weight 4.0 the continuity prior froze on a stale 'C'
+    through a quiet stretch where 'G' consistently scored higher per frame."""
+    from karaoke.harmony import _decode_chord_path
+
+    first = [_viterbi_candidate("C", 0.6, 0)]
+    quiet = [
+        _viterbi_candidate("G", 0.28, 7),
+        _viterbi_candidate("C", 0.24, 0),
+        _viterbi_candidate("N", 0.22, -1),
+    ]
+    path = _decode_chord_path([first] + [list(quiet) for _ in range(5)])
+
+    assert [c["label"] for c in path][1:] == ["G"] * 5
+
+
+def test_viterbi_quiet_fade_resolves_to_no_chord():
+    from karaoke.harmony import _decode_chord_path
+
+    first = [_viterbi_candidate("C", 0.6, 0)]
+    # Truly quiet frames: NO_CHORD scores above the stale chord.
+    fade = [
+        _viterbi_candidate("N", 0.30, -1),
+        _viterbi_candidate("C", 0.20, 0),
+    ]
+    path = _decode_chord_path([first] + [list(fade) for _ in range(5)])
+
+    assert [c["label"] for c in path][1:] == ["N"] * 5
+
+
 def test_key_tie_break_prefers_played_tonic():
     from karaoke.harmony import infer_song_key
 

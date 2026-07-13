@@ -63,7 +63,9 @@ class MultiStepLyricsVerifierProtocol(Protocol):
 
     def verify(self, title: str, draft: TranscriptDraft) -> LyricsVerificationResult: ...
 
-    def post_review_steps(self, job: "Job", original_draft: TranscriptDraft) -> None: ...
+    def post_review_steps(
+        self, job: "Job", original_draft: TranscriptDraft, aligned_segments: list | None = None
+    ) -> None: ...
 
 
 class SubtitleRenderer(Protocol):

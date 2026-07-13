@@ -76,8 +76,11 @@ CHORD_TEMPLATES = (
 _MIN_MATCH_SCORE = 0.32
 _MIN_CONTRAST = 0.020
 _SMOOTHING_CONFIDENCE = 0.78
-# Viterbi transition prior scale (see _decode_chord_path).
-_TRANSITION_WEIGHT = 4.0
+# Viterbi transition prior scale (see _decode_chord_path). 4.0 was strong
+# enough to freeze on a stale chord through quiet passages where another
+# candidate consistently scored higher; 3.0 keeps flicker suppression while
+# letting a persistent per-frame winner take over.
+_TRANSITION_WEIGHT = 3.0
 # Confidence calibration weights (see _collect_chord_candidates).
 _CONFIDENCE_SCORE_WEIGHT = 1.0
 _CONFIDENCE_CONTRAST_WEIGHT = 2.2
