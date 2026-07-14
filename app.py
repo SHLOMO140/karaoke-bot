@@ -27,6 +27,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs the full Telegram API URL (which contains the bot token) at INFO.
+# On a public Space the logs are visible, so keep these quiet to avoid leaking it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger("app")
 
 DOWNLOAD_ROOT = os.path.abspath(str(DOWNLOAD_DIR))
