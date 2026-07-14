@@ -33,6 +33,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger("app")
 
+# Satisfy ZeroGPU's "a @spaces.GPU function must exist" startup check. The bot is
+# CPU-only and never calls this, so no GPU quota is consumed. No-op off ZeroGPU.
+try:  # pragma: no cover - platform specific
+    import spaces
+
+    @spaces.GPU(duration=1)
+    def _keep_zero_gpu_happy():
+        return None
+except Exception:  # noqa: BLE001
+    pass
+
 DOWNLOAD_ROOT = os.path.abspath(str(DOWNLOAD_DIR))
 PORT = int(os.getenv("PORT", "7860"))
 
