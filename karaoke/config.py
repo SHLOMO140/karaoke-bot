@@ -60,7 +60,15 @@ def _materialized_cookie_file() -> str:
 
 def ytdlp_base_opts() -> dict:
     """Return yt-dlp options for bypassing YouTube bot detection."""
-    opts: dict = {"js_runtimes": {"node": {}}, "remote_components": ["ejs:github"]}
+    opts: dict = {
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
+        # Try alternate InnerTube clients — helps get past datacenter-IP 403s
+        # (e.g. from a cloud host) without cookies.
+        "extractor_args": {
+            "youtube": {"player_client": ["default", "tv", "android", "ios", "mweb"]}
+        },
+    }
     materialized = _materialized_cookie_file()
     if YTDLP_COOKIE_FILE:
         opts["cookiefile"] = YTDLP_COOKIE_FILE
