@@ -12,15 +12,23 @@ import os
 
 import aiohttp
 
-from .config import SUPABASE_URL
+from .config import SUPABASE_URL as _CONFIG_SUPABASE_URL
 
 logger = logging.getLogger(__name__)
 
 # The Lovable-managed Supabase belongs to Lovable's org, so the service_role
 # secret isn't obtainable from outside. Instead the bot calls a token-gated
 # SECURITY DEFINER function (public.bot_upsert_song) using the PUBLIC publishable
-# key; the shared token (only the bot knows it) is what authorizes the write.
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+# key; the shared SUPABASE_SYNC_TOKEN (only the bot knows it) is what authorizes
+# the write. The URL and publishable key are public (already exposed in the
+# Lovable web app's bundle), so they carry safe defaults; only the token is a
+# secret and MUST come from the environment — never commit it to this repo.
+SUPABASE_URL = _CONFIG_SUPABASE_URL or os.getenv(
+    "SUPABASE_URL", "https://fsbbvesdhfeepburvssa.supabase.co"
+)
+SUPABASE_ANON_KEY = os.getenv(
+    "SUPABASE_ANON_KEY", "sb_publishable_VUi2ZOW2aPaxkSUqNC8v-A_2y6-DASJ"
+)
 SUPABASE_SYNC_TOKEN = os.getenv("SUPABASE_SYNC_TOKEN", "")
 
 
