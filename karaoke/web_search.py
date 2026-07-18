@@ -25,6 +25,10 @@ from .models import TranscriptDraft
 
 logger = logging.getLogger(__name__)
 
+# In-memory caches (extracted from the former lyrics_verifier module).
+_DIRECT_SITE_SEARCH_CACHE: dict[str, list["SearchResult"]] = {}
+_SITEMAP_URL_CACHE: dict[str, list[str]] = {}
+
 SEARCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

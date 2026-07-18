@@ -44,9 +44,24 @@ _DEFAULT_COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 
 def _materialized_cookie_file() -> str:
-    """On a public host, cookies are passed via the YTDLP_COOKIES_CONTENT secret
-    (env var) instead of a committed file; write it to a runtime file once."""
-    content = os.getenv("YTDLP_COOKIES_CONTENT", "")
+    """On a public host, cookies are passed via an env var instead of a committed
+    file; write it to a runtime file once.
+
+    YTDLP_COOKIES_B64 (base64 of the cookies.txt) is preferred because a plain
+    multi-line value can have its TABs mangled by some env-var stores, which
+    breaks the Netscape cookie format. Falls back to YTDLP_COOKIES_CONTENT.
+    """
+    import base64 as _b64
+
+    content = ""
+    b64 = os.getenv("YTDLP_COOKIES_B64", "")
+    if b64.strip():
+        try:
+            content = _b64.b64decode(b64).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            content = ""
+    if not content.strip():
+        content = os.getenv("YTDLP_COOKIES_CONTENT", "")
     if not content.strip():
         return ""
     target = RUNTIME_DIR / "cookies.txt"
