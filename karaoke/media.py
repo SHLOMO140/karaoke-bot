@@ -136,6 +136,8 @@ def search_youtube(query: str, max_results: int = 5) -> list[dict[str, str]]:
             "channel": entry.get("channel") or entry.get("uploader") or "",
             "duration": f"{minutes}:{seconds:02d}",
             "url": f"https://www.youtube.com/watch?v={video_id}",
+            # YouTube always serves this thumbnail for a valid video id.
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         })
     return results
 

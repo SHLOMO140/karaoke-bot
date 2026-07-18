@@ -66,6 +66,10 @@ def build_results_keyboard(results: list[dict], user_data: dict) -> InlineKeyboa
     return InlineKeyboardMarkup(rows)
 
 
+def _pick_button(vid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ בחר שיר זה", callback_data=f"pick:{vid}")]])
+
+
 def build_song_menu(vid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎸 אקורדים", callback_data=f"chords:{vid}")],
@@ -136,7 +140,34 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not results:
         await msg.edit_text("לא נמצאו תוצאות. נסה ניסוח אחר.")
         return
-    await msg.edit_text("בחר שיר:", reply_markup=build_results_keyboard(results, context.user_data))
+    await msg.edit_text("👇 בחר שיר מהתוצאות:")
+    await _send_results(update, context, results)
+
+
+async def _send_results(update: Update, context: ContextTypes.DEFAULT_TYPE, results: list[dict]) -> None:
+    """Send each result as its own thumbnail message with a select button below it."""
+    songs = context.user_data.setdefault("songs", {})
+    for result in results:
+        vid = result["id"]
+        songs[vid] = {"url": result["url"], "title": result["title"]}
+        caption = format_result(result)
+        markup = _pick_button(vid)
+        try:
+            await update.message.reply_photo(
+                photo=result.get("thumbnail"), caption=caption, reply_markup=markup
+            )
+        except Exception as exc:  # noqa: BLE001 - thumbnail fetch can fail; fall back to text
+            logger.warning("Thumbnail send failed for %s: %s", vid, exc)
+            await update.message.reply_text(caption, reply_markup=markup)
+
+
+async def _respond(query, text: str, reply_markup=None) -> None:
+    """Edit the message in place, but if it's a photo result (no editable text),
+    start a fresh text message instead so the rest of the flow can edit it."""
+    if query.message.photo:
+        await query.message.reply_text(text, reply_markup=reply_markup)
+    else:
+        await query.edit_message_text(text, reply_markup=reply_markup)
 
 
 async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,9 +176,9 @@ async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     vid = query.data.split(":", 1)[1]
     song = _get_song(context, vid)
     if not song:
-        await query.edit_message_text("השיר לא זמין יותר, חפש שוב.")
+        await _respond(query, "השיר לא זמין יותר, חפש שוב.")
         return
-    await query.edit_message_text(f"🎵 {song['title']}", reply_markup=build_song_menu(vid))
+    await _respond(query, f"🎵 {song['title']}", reply_markup=build_song_menu(vid))
 
 
 async def on_chords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
