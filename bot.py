@@ -198,12 +198,15 @@ async def on_chords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.user_data.setdefault("chords", {})[vid] = analysis
 
-    # Library sync — only when chords were found.
-    artist, _ = media.split_artist_and_title(song["title"])
+    # Library sync — only when chords were found. Store a clean singer + song
+    # name (not the raw YouTube upload title with its "(Official Video)" clutter).
+    artist, song_name = media.split_artist_and_title(song["title"])
     sheet = getattr(analysis, "parsed_sheet", None)
     content = library_sync.to_inline_chords(sheet) if sheet else analysis.chord_sheet_text
     asyncio.create_task(
-        library_sync.upsert_song(song["title"], artist, analysis.original_key, content)
+        library_sync.upsert_song(
+            song_name or song["title"], artist, analysis.original_key, content
+        )
     )
 
     await _deliver_chords(query, context, vid, "original")

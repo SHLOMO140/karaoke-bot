@@ -34,17 +34,28 @@ def safe_filename(title: str) -> str:
 
 
 def split_artist_and_title(title: str) -> tuple[str, str]:
-    normalized = str(title or "").strip()
-    if not normalized:
+    """Parse a (possibly noisy) YouTube title into (artist, song_name).
+
+    Reuses the chord-search title cleaner to drop clutter — "(Official Video)",
+    "[HD]", niqqud, "prod. by", and a trailing "| channel/translation" segment —
+    then splits on a dash/colon. Either part may be "" when it can't be
+    determined, so the library stores a clean singer + song name instead of the
+    raw upload title.
+    """
+    from .web_search import _normalize_title_text
+
+    clean = _normalize_title_text(str(title or ""))
+    if not clean:
         return "", ""
-    for separator in (" - ", " – ", " — ", " | "):
-        if separator not in normalized:
-            continue
-        artist, song_title = normalized.split(separator, 1)
-        artist, song_title = artist.strip(), song_title.strip()
-        if artist and song_title:
-            return artist, song_title
-    return "", normalized
+    # If the title bundles a translation as "עברית | latin", keep the Hebrew side.
+    parts = [p.strip() for p in clean.split("|") if p.strip()]
+    primary = next(
+        (p for p in reversed(parts) if re.search(r"[֐-׿]", p)), clean
+    )
+    dash = re.split(r"\s*[-–—:]\s*", primary, maxsplit=1)
+    if len(dash) == 2 and dash[0].strip() and dash[1].strip():
+        return dash[0].strip(), dash[1].strip()
+    return "", primary.strip()
 
 
 # --------------------------------------------------------------------------- #
