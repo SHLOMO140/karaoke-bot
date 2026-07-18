@@ -16,6 +16,7 @@ import secrets
 import shutil
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram.ext import ApplicationBuilder
@@ -69,6 +70,24 @@ def resolve_link(token: str) -> str | None:
 
 def _link_builder(path: str) -> str:
     return f"{PUBLIC_BASE_URL.rstrip('/')}/d/{register_link(path)}"
+
+
+def _self_ping() -> None:
+    """Hit our own public URL so the host's idle timer never fires.
+
+    Render's free tier spins a web service down after ~15 min with no *inbound*
+    HTTP traffic; the bot only makes outbound long-poll calls, so without this it
+    would sleep and stop responding. Pinging our public URL every few minutes
+    counts as inbound traffic and keeps the service awake 24/7 — no external
+    uptime service or account needed. RENDER_EXTERNAL_URL is injected by Render.
+    """
+    url = os.getenv("RENDER_EXTERNAL_URL") or PUBLIC_BASE_URL
+    if not url:
+        return
+    try:
+        urllib.request.urlopen(url.rstrip("/") + "/health", timeout=10).read()
+    except Exception as exc:  # noqa: BLE001 - best-effort keep-alive
+        logger.debug("Self-ping failed: %s", exc)
 
 
 def _sweep_downloads() -> None:
@@ -135,6 +154,7 @@ async def _bot_main() -> None:
     logger.info("Telegram bot polling started")
     while True:
         await asyncio.sleep(300)
+        await asyncio.to_thread(_self_ping)  # keep the free instance awake
         _sweep_downloads()
 
 
