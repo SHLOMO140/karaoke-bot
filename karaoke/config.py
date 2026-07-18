@@ -169,3 +169,27 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://user-space.hf
 FILE_SERVER_PORT = int(os.getenv("PORT", "7860"))
 TELEGRAM_FILE_LIMIT_BYTES = int(os.getenv("TELEGRAM_FILE_LIMIT_BYTES", str(50 * 1024 * 1024)))
 LINK_TTL_SECONDS = int(os.getenv("LINK_TTL_SECONDS", str(2 * 3600)))
+
+
+# --------------------------------------------------------------------------- #
+# xAI Grok API (lyrics verification / analysis).
+# --------------------------------------------------------------------------- #
+def _load_grok_api_key() -> str:
+    for env_name in ("GROK_API_KEY", "XAI_API_KEY"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.local"):
+        value = _load_env_value(candidate, {"GROK_API_KEY", "XAI_API_KEY"})
+        if value:
+            return value
+    return ""
+
+
+GROK_API_KEY: str = _load_grok_api_key()
+GROK_MODEL: str = (
+    os.getenv("GROK_MODEL") or os.getenv("XAI_MODEL")
+    or _load_env_value(BASE_DIR / ".env.local", {"GROK_MODEL", "XAI_MODEL"})
+    or _load_env_value(BASE_DIR / ".env", {"GROK_MODEL", "XAI_MODEL"})
+    or "grok-3-mini"
+)

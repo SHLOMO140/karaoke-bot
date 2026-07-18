@@ -152,10 +152,13 @@ async def _bot_main() -> None:
     await application.start()
     await application.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot polling started")
+    tick = 0
     while True:
-        await asyncio.sleep(300)
-        await asyncio.to_thread(_self_ping)  # keep the free instance awake
-        _sweep_downloads()
+        await asyncio.sleep(240)  # ping every 4 min — HF Spaces sleeps at ~5 min idle
+        await asyncio.to_thread(_self_ping)
+        tick += 1
+        if tick % 5 == 0:  # sweep once per 20 min
+            _sweep_downloads()
 
 
 if __name__ == "__main__":

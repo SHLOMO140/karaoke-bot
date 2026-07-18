@@ -107,7 +107,7 @@ class CharacterTiming:
 class VerificationVerdict(str, Enum):
     """Verdict for the new multi-step lyrics verification."""
     CONSENSUS = "consensus"          # 3+ sources agreed
-    GEMINI_VERIFIED = "gemini_verified"  # Gemini decided
+    GROK_VERIFIED = "grok_verified"  # Grok decided
     HUMAN_APPROVED = "human_approved"    # User approved/corrected
     NO_SOURCES = "no_sources"        # No web sources found
     NOT_RUN = "not_run"
@@ -118,8 +118,8 @@ class DisputedLine:
     """A lyrics line where sources disagree."""
     line_number: int
     versions: dict[str, str]  # source_name → text
-    gemini_recommendation: str | None = None
-    gemini_confidence: float = 0.0
+    grok_recommendation: str | None = None
+    grok_confidence: float = 0.0
 
 
 @dataclass
@@ -147,7 +147,7 @@ class CharDiff:
     original_word: str
     corrected_word: str
     char_changes: list[CharChange] = field(default_factory=list)
-    gemini_explanation: str | None = None
+    grok_explanation: str | None = None
 
 
 @dataclass
