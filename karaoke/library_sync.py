@@ -13,6 +13,7 @@ import os
 import aiohttp
 
 from .config import SUPABASE_URL as _CONFIG_SUPABASE_URL
+from .harmony import transpose_chord_label
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +46,29 @@ def _reconstruct_line(words) -> list[str]:
     return buf
 
 
-def to_inline_chords(sheet) -> str:
-    """Render a parsed Tab4U sheet as inline [Chord] text for the library."""
+def to_inline_chords(sheet, semitones: int = 0) -> str:
+    """Render a parsed Tab4U sheet as inline `[Chord]word` text.
+
+    This is the library format, and it is also what the bot sends to Telegram:
+    an inline chord glued to its word is immune to the right-to-left/left-to-right
+    (BiDi) scrambling that breaks a chords-above-lyrics column layout for Hebrew.
+
+    `semitones` transposes every chord label (used for the 'easy' key); 0 keeps
+    the original key, which is what the library stores.
+    """
+    def _label(raw: str) -> str:
+        return transpose_chord_label(raw, semitones) if semitones else raw
+
     lines: list[str] = []
     for chord_tokens, lyric_words in sheet.line_word_pairs:
         if lyric_words:
             chars = _reconstruct_line(lyric_words)
             for tok in sorted(chord_tokens, key=lambda t: t.column, reverse=True):
                 col = min(tok.column, len(chars))
-                chars.insert(col, f"[{tok.label}]")
+                chars.insert(col, f"[{_label(tok.label)}]")
             lines.append("".join(chars).rstrip())
         elif chord_tokens:
-            lines.append("  |  ".join(f"[{t.label}]" for t in chord_tokens))
+            lines.append("  |  ".join(f"[{_label(t.label)}]" for t in chord_tokens))
         else:
             lines.append("")
     return "\n".join(lines).strip()

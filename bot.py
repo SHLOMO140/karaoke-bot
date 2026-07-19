@@ -225,7 +225,9 @@ async def on_chord_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _deliver_chords(query, context, vid: str, mode: str) -> None:
     song = _get_song(context, vid)
     analysis = context.user_data["chords"][vid]
-    text = chords.render(analysis, song["title"], mode)
+    # Inline [Chord]word layout — RTL-safe in Telegram (the column layout scrambles
+    # when Hebrew lyrics meet Latin chord labels under bidirectional text).
+    text = chords.render_inline(analysis, song["title"], mode)
     if len(text) <= TELEGRAM_TEXT_LIMIT - 100:
         try:
             await query.edit_message_text(text, reply_markup=build_chord_keyboard(vid))
