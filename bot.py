@@ -9,12 +9,14 @@ pick a song -> [chords] / [download] -> [video|mp3] -> quality -> deliver ->
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import logging
 import os
 import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -222,21 +224,34 @@ async def on_chord_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _deliver_chords(query, context, vid, mode)
 
 
+def _rtl_pre(text: str) -> str:
+    """Wrap chords-above-lyrics text for Telegram: monospace (<pre>) so the space
+    padding that lines up chords over their words actually renders at a fixed
+    width, plus a Right-to-Left Mark on every line so Telegram's bidi handling
+    keeps the Latin chord line anchored the same way as the Hebrew lyric line
+    below it (otherwise the two lines default to opposite text directions and
+    the columns drift apart)."""
+    rlm = "‏"  # RIGHT-TO-LEFT MARK
+    marked = "\n".join(f"{rlm}{line}" if line else line for line in text.split("\n"))
+    return f"<pre>{html.escape(marked, quote=False)}</pre>"
+
+
 async def _deliver_chords(query, context, vid: str, mode: str) -> None:
     song = _get_song(context, vid)
     analysis = context.user_data["chords"][vid]
-    # Inline [Chord]word layout — RTL-safe in Telegram (the column layout scrambles
-    # when Hebrew lyrics meet Latin chord labels under bidirectional text).
-    text = chords.render_inline(analysis, song["title"], mode)
-    if len(text) <= TELEGRAM_TEXT_LIMIT - 100:
+    plain_text = chords.render(analysis, song["title"], mode)
+    if len(plain_text) <= TELEGRAM_TEXT_LIMIT - 100:
         try:
-            await query.edit_message_text(text, reply_markup=build_chord_keyboard(vid))
+            await query.edit_message_text(
+                _rtl_pre(plain_text), parse_mode=ParseMode.HTML,
+                reply_markup=build_chord_keyboard(vid),
+            )
             return
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
                 return
     # Too long for a message — send as a file, keep the menu on the original message.
-    buffer = io.BytesIO(text.encode("utf-8"))
+    buffer = io.BytesIO(plain_text.encode("utf-8"))
     buffer.name = f"{song['title']}.txt"
     await context.bot.send_document(chat_id=query.message.chat_id, document=buffer)
     await query.edit_message_text(f"🎸 {song['title']}", reply_markup=build_song_menu(vid))

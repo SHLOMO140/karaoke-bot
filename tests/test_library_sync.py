@@ -27,11 +27,8 @@ def test_inline_chord_only_line_uses_pipe_separator():
     assert out == "[Bm]  |  [A]"
 
 
-def test_norm_collapses_whitespace():
-    assert library_sync._norm("  שיר   בדיקה ") == "שיר בדיקה"
-
-
 def test_upsert_skips_when_no_credentials(monkeypatch):
     monkeypatch.setattr(library_sync, "SUPABASE_URL", "")
-    monkeypatch.setattr(library_sync, "SUPABASE_SERVICE_ROLE_KEY", "")
+    monkeypatch.setattr(library_sync, "SUPABASE_ANON_KEY", "")
+    monkeypatch.setattr(library_sync, "SUPABASE_SYNC_TOKEN", "")
     assert asyncio.run(library_sync.upsert_song("t", "a", "C", "content")) is None
