@@ -788,6 +788,29 @@ def _transpose_row_text(row_text: str, semitones: int) -> str:
     return "".join(parts).rstrip()
 
 
+def _mirror_chord_row_for_rtl(row_text: str, pair_width: int = 0) -> str:
+    """Flip a chords-row's column positions end-to-end, without scrambling any
+    chord label's own spelling, so it stays aligned with the Hebrew lyric row
+    Telegram renders beneath it.
+
+    Telegram (like any bidi-aware renderer) automatically displays a Hebrew
+    line in reverse character position within ITS OWN length — that's what
+    makes Hebrew read correctly right-to-left. A pure-Latin chord row gets no
+    such treatment, so left untouched it stays anchored to the opposite edge
+    from the lyric row beneath it. `pair_width` is that lyric row's length
+    (the two rows must be mirrored within the SAME width, or a short chord row
+    — e.g. a single "Cm" meant to sit above the start of a much longer lyric
+    line — mirrors within its own tiny width and lands nowhere near the lyric
+    row's reversed position); the chord row is right-padded to it before
+    mirroring. A flat `row_text[::-1]` would also reverse the letters *within*
+    each chord label (e.g. "C#m" -> "m#C"), so each non-space token is reversed
+    a second time in place to undo that.
+    """
+    padded = row_text.ljust(max(len(row_text), pair_width))
+    reversed_text = padded[::-1]
+    return re.sub(r"\S+", lambda m: m.group(0)[::-1], reversed_text)
+
+
 def _render_external_chord_sheet(
     title: str,
     parsed_sheet: _ParsedTab4USheet,
@@ -797,6 +820,7 @@ def _render_external_chord_sheet(
     original_key: str,
     target_key: str,
     semitones: int,
+    mirror_chords_for_rtl: bool = False,
 ) -> str:
     header_parts = [f"כותרת: {title or 'ללא שם'}"]
     header_parts.append(f"קצב: {bpm:.0f}" if bpm > 0 else "קצב: לא ידוע")
@@ -808,8 +832,15 @@ def _render_external_chord_sheet(
 
     lines = header_parts + [""]
     for table in parsed_sheet.tables:
-        for row in table:
-            text = _transpose_row_text(row.text, semitones) if row.kind == "chords" else row.text.rstrip()
+        for i, row in enumerate(table):
+            if row.kind == "chords":
+                text = _transpose_row_text(row.text, semitones)
+                if mirror_chords_for_rtl:
+                    next_row = table[i + 1] if i + 1 < len(table) else None
+                    pair_width = len(next_row.text.rstrip()) if next_row and next_row.kind != "chords" else 0
+                    text = _mirror_chord_row_for_rtl(text, pair_width)
+            else:
+                text = row.text.rstrip()
             if text.strip():
                 lines.append(text.rstrip())
         if lines[-1] != "":
