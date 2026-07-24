@@ -1,6 +1,25 @@
-from karaoke.chord_sources import lookup_external_chord_sheet, lookup_external_chord_sheet_by_title
+from karaoke.chord_sources import (
+    _parse_tab4u_sheet,
+    lookup_external_chord_sheet,
+    lookup_external_chord_sheet_by_title,
+)
 from karaoke.web_search import SearchResult
 from karaoke.models import TranscriptSegment, WordTiming
+
+
+# Mirrors real Tab4U markup for a lone chord meant to sit mid-line: three
+# leading &nbsp; before "Cm" (Tab4U pads a chords row's edges with &nbsp; to
+# match its paired lyric row — see chord_sources._clean_layout_text).
+TAB4U_LEADING_PADDING_HTML = """
+<div id="songContentTPL" align="right">
+  <table border="0" cellspacing="0" cellpadding="0">
+    <tbody>
+      <tr><td class="chords">&nbsp;&nbsp;&nbsp;<span class="c_C">Cm</span></td></tr>
+      <tr><td class="song">את&nbsp;מלכה&nbsp;אבל&nbsp;עדיין</td></tr>
+    </tbody>
+  </table>
+</div>
+"""
 
 
 TAB4U_SAMPLE_HTML = """
@@ -267,3 +286,20 @@ def test_lookup_external_chord_sheet_stitches_medley_sections_from_multiple_sour
     }
     assert "הלב שלי נפתח הלילה" in analysis.chord_sheet_text
     assert "בין האורות אני חוזר" in analysis.chord_sheet_text
+
+
+def test_chord_token_column_uses_layout_text_not_stripped_text():
+    # Regression test for the root cause behind every failed chord-alignment
+    # attempt: a lone chord meant to sit mid-line (here "Cm", 3 real leading
+    # &nbsp; before it) must report column=3, not column=0. Column 0 is what
+    # you get from the whitespace-STRIPPED text (used for search matching)
+    # instead of the browser-faithful layout_text — that off-by-N bug fed
+    # wrong positions into both the inline Telegram renderer and the
+    # Lovable/Supabase library sync.
+    sheet = _parse_tab4u_sheet(TAB4U_LEADING_PADDING_HTML, "https://www.tab4u.com/tabs/songs/1.html")
+    assert sheet is not None
+    assert len(sheet.line_word_pairs) == 1
+    tokens, words = sheet.line_word_pairs[0]
+    assert [t.label for t in tokens] == ["Cm"]
+    assert tokens[0].column == 3
+    assert [w.text for w in words] == ["את", "מלכה", "אבל", "עדיין"]

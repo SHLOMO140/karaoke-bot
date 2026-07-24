@@ -189,7 +189,13 @@ def _parse_tab4u_sheet(page_html: str, source_url: str) -> _ParsedTab4USheet | N
             layout_text = _clean_layout_text(cell_html)
 
             if "chords" in normalized_class:
-                tokens = _extract_chord_tokens(cleaned_text)
+                # Columns must come from layout_text (Tab4U's real, &nbsp;-padded
+                # positions), not the stripped cleaned_text — a lone chord whose
+                # true column is e.g. 3 (padded to sit mid-line) would otherwise
+                # always report column 0, breaking every consumer of these
+                # tokens: line_word_pairs (inline rendering + the Supabase
+                # library sync) and the pixel-exact image renderer alike.
+                tokens = _extract_chord_tokens(layout_text)
                 chord_labels.extend(token.label for token in tokens)
                 chord_row = _ChordRow(
                     kind="chords", text=cleaned_text, tokens=tokens, layout_text=layout_text

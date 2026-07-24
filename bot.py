@@ -9,7 +9,6 @@ pick a song -> [chords] / [download] -> [video|mp3] -> quality -> deliver ->
 from __future__ import annotations
 
 import asyncio
-import html
 import io
 import logging
 import os
@@ -226,33 +225,33 @@ async def on_chord_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _deliver_chords(query, context, vid, mode)
 
 
-def _as_pre(text: str) -> str:
-    """Wrap chord-sheet text as a Telegram monospace (<pre>) block.
-
-    Spaces become U+00A0 so the delivery pipeline can't collapse them — Tab4U's
-    own source does the same (every space in its chord/lyric HTML is a literal
-    &nbsp;, never a plain space) specifically to keep alignment-carrying
-    padding intact.
-    """
-    nbsp_text = text.replace(" ", " ")
-    return f"<pre>{html.escape(nbsp_text, quote=False)}</pre>"
-
-
 async def _deliver_chords(query, context, vid: str, mode: str) -> None:
+    """Send each chord bolded directly before the word it belongs to.
+
+    A chords-above-lyrics layout needs a Latin chord row and a Hebrew lyric
+    row to land in the same monospace columns, which turned out to be
+    unreliable across Telegram clients (different platforms use different
+    <pre> fonts with different relative Hebrew/Latin glyph widths — no amount
+    of space padding fixes that consistently). Gluing the chord directly next
+    to its own word in the same text run needs no cross-line alignment at
+    all, so it can't drift regardless of font or device.
+    """
     song = _get_song(context, vid)
     analysis = context.user_data["chords"][vid]
-    plain_text = chords.render(analysis, song["title"], mode)
-    if len(plain_text) <= TELEGRAM_TEXT_LIMIT - 100:
+    rich_text = chords.render_inline_html(analysis, song["title"], mode)
+    if len(rich_text) <= TELEGRAM_TEXT_LIMIT - 100:
         try:
             await query.edit_message_text(
-                _as_pre(plain_text), parse_mode=ParseMode.HTML,
+                rich_text, parse_mode=ParseMode.HTML,
                 reply_markup=build_chord_keyboard(vid),
             )
             return
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
                 return
-    # Too long for a message — send as a file, keep the menu on the original message.
+    # Too long for a message — send as a plain-text file, keep the menu on the
+    # original message.
+    plain_text = chords.render(analysis, song["title"], mode)
     buffer = io.BytesIO(plain_text.encode("utf-8"))
     buffer.name = f"{song['title']}.txt"
     await context.bot.send_document(chat_id=query.message.chat_id, document=buffer)
