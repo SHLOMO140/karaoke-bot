@@ -224,29 +224,27 @@ async def on_chord_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _deliver_chords(query, context, vid, mode)
 
 
-def _rtl_pre(text: str) -> str:
-    """Wrap chord-sheet text for Telegram: monospace (<pre>) so the space
-    padding that lines up chords over their words actually renders at a fixed
-    width instead of a proportional font, plus a Right-to-Left Mark on every
-    line so Telegram's bidi handling anchors the Latin chord line the same way
-    as the Hebrew lyric line below it."""
-    rlm = "‏"  # RIGHT-TO-LEFT MARK
-    marked = "\n".join(f"{rlm}{line}" if line else line for line in text.split("\n"))
-    return f"<pre>{html.escape(marked, quote=False)}</pre>"
+def _as_pre(text: str) -> str:
+    """Wrap chord-sheet text as a Telegram monospace (<pre>) block, so the
+    space padding that right-aligns each chords row to its lyric row (see
+    chords.render(..., for_telegram=True)) renders at a fixed character width
+    instead of a proportional font, where the same space count doesn't line up
+    the same as the character count above/below it."""
+    return f"<pre>{html.escape(text, quote=False)}</pre>"
 
 
 async def _deliver_chords(query, context, vid: str, mode: str) -> None:
     song = _get_song(context, vid)
     analysis = context.user_data["chords"][vid]
-    # Two renders: the file fallback keeps normal (unreordered) text — the
-    # left-to-right/right-to-left reorder is only meaningful inside Telegram's
-    # own bidi-aware message rendering, not in a plain-text file opened elsewhere.
+    # Two renders: the file fallback keeps the row's own (unpadded) width —
+    # the padding that right-aligns it to its lyric row only makes sense inside
+    # Telegram's monospace message, not in a plain-text file opened elsewhere.
     plain_text = chords.render(analysis, song["title"], mode)
     telegram_text = chords.render(analysis, song["title"], mode, for_telegram=True)
     if len(telegram_text) <= TELEGRAM_TEXT_LIMIT - 100:
         try:
             await query.edit_message_text(
-                _rtl_pre(telegram_text), parse_mode=ParseMode.HTML,
+                _as_pre(telegram_text), parse_mode=ParseMode.HTML,
                 reply_markup=build_chord_keyboard(vid),
             )
             return

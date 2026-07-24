@@ -788,25 +788,21 @@ def _transpose_row_text(row_text: str, semitones: int) -> str:
     return "".join(parts).rstrip()
 
 
-def _reverse_chord_order_in_place(row_text: str) -> str:
-    """Reverse which label sits in which slot on a multi-chord row, keeping
-    every slot's column position and surrounding spacing untouched — e.g.
-    "Ab                Fm" -> "Fm                Ab".
+def _right_align_chord_row(row_text: str, pair_width: int = 0) -> str:
+    """Right-justify a chords row within its paired lyric row's width, without
+    reordering its labels.
 
-    The column *positions* already line up fine once the sheet is sent as a
-    monospace block (see _as_pre in bot.py); the remaining bug is that a line
-    with more than one chord reads its labels in storage order (Ab then Fm)
-    while the Hebrew lyric line below it reads right-to-left, so the chords
-    end up matched to the wrong words. Swapping which label occupies which
-    existing slot (not reflowing/padding the row) fixes the pairing without
-    touching anything that was already correctly positioned. A row with 0 or 1
-    tokens has no "order" to fix and is returned unchanged.
+    Confirmed straight from Tab4U's own stylesheet (.chords{direction:ltr;
+    text-align:right}): a chords row is explicitly forced LTR — its labels are
+    NEVER bidi-reordered, they stay in left-to-right storage order (Ab then Fm
+    stays Ab then Fm) — but the row as a whole is right-aligned, so a short
+    chord row (often just one label) sits flush with the right edge of the
+    much longer Hebrew lyric row beneath it (which has no such override, so it
+    renders as normal RTL Hebrew). `pair_width` is that lyric row's length;
+    left-padding to it reproduces the same right-alignment in a monospace
+    Telegram message.
     """
-    matches = list(re.finditer(r"\S+", row_text))
-    if len(matches) < 2:
-        return row_text
-    reversed_labels = iter(m.group(0) for m in reversed(matches))
-    return re.sub(r"\S+", lambda _m: next(reversed_labels), row_text)
+    return row_text.rjust(max(len(row_text), pair_width))
 
 
 def _render_external_chord_sheet(
@@ -830,11 +826,13 @@ def _render_external_chord_sheet(
 
     lines = header_parts + [""]
     for table in parsed_sheet.tables:
-        for row in table:
+        for i, row in enumerate(table):
             if row.kind == "chords":
                 text = _transpose_row_text(row.text, semitones)
                 if mirror_chords_for_rtl:
-                    text = _reverse_chord_order_in_place(text)
+                    next_row = table[i + 1] if i + 1 < len(table) else None
+                    pair_width = len(next_row.text.rstrip()) if next_row and next_row.kind != "chords" else 0
+                    text = _right_align_chord_row(text, pair_width)
             else:
                 text = row.text.rstrip()
             if text.strip():

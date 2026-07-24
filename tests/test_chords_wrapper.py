@@ -38,40 +38,49 @@ def test_render_falls_back_to_sheet_text_without_parsed_sheet():
     assert chords.render(a, "t", mode="easy") == "fallback text"
 
 
-def test_render_for_telegram_leaves_a_single_chord_row_unchanged():
+def test_render_for_telegram_right_aligns_a_single_chord_without_reordering():
+    # Real Tab4U row for אושר כהן - כולם גנבים: a lone "Cm" (2 chars) paired
+    # with a 17-char Hebrew lyric row (confirmed via chord_sources._right_align_chord_row's
+    # docstring: Tab4U's own .chords CSS is direction:ltr; text-align:right).
     a = SongAnalysis()
     a.original_key = "C"
     a.transpose_semitones = 0
+    lyric = "את מלכה אבל עדיין"
     rows = [
         _ChordRow(kind="chords", text="Cm", tokens=[_ChordToken("Cm", 0)]),
-        _ChordRow(kind="song", text="את מלכה אבל עדיין"),
+        _ChordRow(kind="song", text=lyric),
     ]
     a.parsed_sheet = _ParsedTab4USheet(
         source_url="u", tables=[rows], lyric_lines=[], line_word_pairs=[], chord_labels=["Cm"],
     )
     out = chords.render(a, "t", for_telegram=True)
-    # A single chord has no "order" to fix — its position was already correct
-    # once the sheet renders as a monospace block, so it's left untouched.
-    assert "\nCm\n" in out or out.rstrip().endswith("\nCm")
+    chord_line = next(line for line in out.splitlines() if "Cm" in line)
+    # Right-justified to the lyric row's width, label order untouched (there's
+    # only one label anyway).
+    assert chord_line == "Cm".rjust(len(lyric))
 
 
-def test_render_for_telegram_reverses_multi_chord_order_in_place():
+def test_render_for_telegram_right_aligns_multi_chord_row_without_reordering():
+    # Real Tab4U row: "Ab              Fm" (18 chars) paired with a 32-char
+    # Hebrew lyric row.
     a = SongAnalysis()
     a.original_key = "C"
     a.transpose_semitones = 0
+    chord_row = "Ab              Fm"
+    lyric = "תסתכלי לי בעיניים בטח שוב תגלגלי"
     rows = [
         _ChordRow(
-            kind="chords", text="Ab                Fm",
-            tokens=[_ChordToken("Ab", 0), _ChordToken("Fm", 18)],
+            kind="chords", text=chord_row,
+            tokens=[_ChordToken("Ab", 0), _ChordToken("Fm", 16)],
         ),
-        _ChordRow(kind="song", text="תסתכלי לי בעינים בטח שוב תגלגלי"),
+        _ChordRow(kind="song", text=lyric),
     ]
     a.parsed_sheet = _ParsedTab4USheet(
         source_url="u", tables=[rows], lyric_lines=[], line_word_pairs=[], chord_labels=["Ab", "Fm"],
     )
     out = chords.render(a, "t", for_telegram=True)
     chord_line = next(line for line in out.splitlines() if "Ab" in line or "Fm" in line)
-    # Same slots/spacing as the source row — only which label sits in which
-    # slot is swapped (Fm now first, Ab now last), matching the Hebrew lyric
-    # line's right-to-left reading beneath it.
-    assert chord_line == "Fm                Ab"
+    # Same left-to-right label order as the source (Ab still before Fm) — only
+    # left-padded so the whole row shifts right to the lyric row's width.
+    assert chord_line == chord_row.rjust(len(lyric))
+    assert chord_line.index("Ab") < chord_line.index("Fm")

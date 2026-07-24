@@ -20,10 +20,9 @@ def render(
     """Render the chord sheet as text.
 
     mode='original' -> keep the scraped key; mode='easy' -> transpose to the easy key.
-    for_telegram=True reverses which label sits in which slot on multi-chord
-    rows, so they pair with the right word in the Hebrew lyric line Telegram
-    renders right-to-left beneath them (see
-    chord_sources._reverse_chord_order_in_place).
+    for_telegram=True right-aligns each chords row to its paired Hebrew lyric
+    row's width, matching Tab4U's own CSS for a chords row (direction:ltr;
+    text-align:right — see chord_sources._right_align_chord_row).
     """
     sheet = getattr(analysis, "parsed_sheet", None)
     if sheet is None:
