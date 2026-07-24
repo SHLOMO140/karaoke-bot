@@ -788,27 +788,25 @@ def _transpose_row_text(row_text: str, semitones: int) -> str:
     return "".join(parts).rstrip()
 
 
-def _mirror_chord_row_for_rtl(row_text: str, pair_width: int = 0) -> str:
-    """Flip a chords-row's column positions end-to-end, without scrambling any
-    chord label's own spelling, so it stays aligned with the Hebrew lyric row
-    Telegram renders beneath it.
+def _reverse_chord_order_in_place(row_text: str) -> str:
+    """Reverse which label sits in which slot on a multi-chord row, keeping
+    every slot's column position and surrounding spacing untouched — e.g.
+    "Ab                Fm" -> "Fm                Ab".
 
-    Telegram (like any bidi-aware renderer) automatically displays a Hebrew
-    line in reverse character position within ITS OWN length — that's what
-    makes Hebrew read correctly right-to-left. A pure-Latin chord row gets no
-    such treatment, so left untouched it stays anchored to the opposite edge
-    from the lyric row beneath it. `pair_width` is that lyric row's length
-    (the two rows must be mirrored within the SAME width, or a short chord row
-    — e.g. a single "Cm" meant to sit above the start of a much longer lyric
-    line — mirrors within its own tiny width and lands nowhere near the lyric
-    row's reversed position); the chord row is right-padded to it before
-    mirroring. A flat `row_text[::-1]` would also reverse the letters *within*
-    each chord label (e.g. "C#m" -> "m#C"), so each non-space token is reversed
-    a second time in place to undo that.
+    The column *positions* already line up fine once the sheet is sent as a
+    monospace block (see _as_pre in bot.py); the remaining bug is that a line
+    with more than one chord reads its labels in storage order (Ab then Fm)
+    while the Hebrew lyric line below it reads right-to-left, so the chords
+    end up matched to the wrong words. Swapping which label occupies which
+    existing slot (not reflowing/padding the row) fixes the pairing without
+    touching anything that was already correctly positioned. A row with 0 or 1
+    tokens has no "order" to fix and is returned unchanged.
     """
-    padded = row_text.ljust(max(len(row_text), pair_width))
-    reversed_text = padded[::-1]
-    return re.sub(r"\S+", lambda m: m.group(0)[::-1], reversed_text)
+    matches = list(re.finditer(r"\S+", row_text))
+    if len(matches) < 2:
+        return row_text
+    reversed_labels = iter(m.group(0) for m in reversed(matches))
+    return re.sub(r"\S+", lambda _m: next(reversed_labels), row_text)
 
 
 def _render_external_chord_sheet(
@@ -832,13 +830,11 @@ def _render_external_chord_sheet(
 
     lines = header_parts + [""]
     for table in parsed_sheet.tables:
-        for i, row in enumerate(table):
+        for row in table:
             if row.kind == "chords":
                 text = _transpose_row_text(row.text, semitones)
                 if mirror_chords_for_rtl:
-                    next_row = table[i + 1] if i + 1 < len(table) else None
-                    pair_width = len(next_row.text.rstrip()) if next_row and next_row.kind != "chords" else 0
-                    text = _mirror_chord_row_for_rtl(text, pair_width)
+                    text = _reverse_chord_order_in_place(text)
             else:
                 text = row.text.rstrip()
             if text.strip():

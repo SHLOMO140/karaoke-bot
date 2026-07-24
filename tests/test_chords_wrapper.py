@@ -38,22 +38,40 @@ def test_render_falls_back_to_sheet_text_without_parsed_sheet():
     assert chords.render(a, "t", mode="easy") == "fallback text"
 
 
-def test_render_for_telegram_right_anchors_a_single_chord_to_its_lyric_row():
+def test_render_for_telegram_leaves_a_single_chord_row_unchanged():
     a = SongAnalysis()
     a.original_key = "C"
-    a.target_key = "Am"
     a.transpose_semitones = 0
-    lyric = "את מלכה אבל עדיין"
     rows = [
         _ChordRow(kind="chords", text="Cm", tokens=[_ChordToken("Cm", 0)]),
-        _ChordRow(kind="song", text=lyric),
+        _ChordRow(kind="song", text="את מלכה אבל עדיין"),
     ]
     a.parsed_sheet = _ParsedTab4USheet(
         source_url="u", tables=[rows], lyric_lines=[], line_word_pairs=[], chord_labels=["Cm"],
     )
     out = chords.render(a, "t", for_telegram=True)
-    chord_line = next(line for line in out.splitlines() if "Cm" in line)
-    # Right-anchored to the lyric row's own width, not left at column 0 — a
-    # Hebrew-reading reader expects the chord to line up with the RIGHT edge,
-    # matching where Telegram displays that row's first character.
-    assert chord_line == "Cm".rjust(len(lyric))
+    # A single chord has no "order" to fix — its position was already correct
+    # once the sheet renders as a monospace block, so it's left untouched.
+    assert "\nCm\n" in out or out.rstrip().endswith("\nCm")
+
+
+def test_render_for_telegram_reverses_multi_chord_order_in_place():
+    a = SongAnalysis()
+    a.original_key = "C"
+    a.transpose_semitones = 0
+    rows = [
+        _ChordRow(
+            kind="chords", text="Ab                Fm",
+            tokens=[_ChordToken("Ab", 0), _ChordToken("Fm", 18)],
+        ),
+        _ChordRow(kind="song", text="תסתכלי לי בעינים בטח שוב תגלגלי"),
+    ]
+    a.parsed_sheet = _ParsedTab4USheet(
+        source_url="u", tables=[rows], lyric_lines=[], line_word_pairs=[], chord_labels=["Ab", "Fm"],
+    )
+    out = chords.render(a, "t", for_telegram=True)
+    chord_line = next(line for line in out.splitlines() if "Ab" in line or "Fm" in line)
+    # Same slots/spacing as the source row — only which label sits in which
+    # slot is swapped (Fm now first, Ab now last), matching the Hebrew lyric
+    # line's right-to-left reading beneath it.
+    assert chord_line == "Fm                Ab"

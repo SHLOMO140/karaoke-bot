@@ -20,9 +20,10 @@ def render(
     """Render the chord sheet as text.
 
     mode='original' -> keep the scraped key; mode='easy' -> transpose to the easy key.
-    for_telegram=True mirrors each chords-row's column positions so they stay
-    aligned with the Hebrew lyric row Telegram auto-reverses beneath it (see
-    chord_sources._mirror_chord_row_for_rtl).
+    for_telegram=True reverses which label sits in which slot on multi-chord
+    rows, so they pair with the right word in the Hebrew lyric line Telegram
+    renders right-to-left beneath them (see
+    chord_sources._reverse_chord_order_in_place).
     """
     sheet = getattr(analysis, "parsed_sheet", None)
     if sheet is None:
