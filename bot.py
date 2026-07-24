@@ -227,67 +227,22 @@ async def on_chord_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def _as_pre(text: str) -> str:
-    """Wrap chord-sheet text as a Telegram monospace (<pre>) block (fallback path).
+    """Wrap chord-sheet text as a Telegram monospace (<pre>) block.
 
-    Spaces become U+00A0 so the delivery pipeline can't collapse them.
+    Spaces become U+00A0 so the delivery pipeline can't collapse them — Tab4U's
+    own source does the same (every space in its chord/lyric HTML is a literal
+    &nbsp;, never a plain space) specifically to keep alignment-carrying
+    padding intact.
     """
     nbsp_text = text.replace(" ", " ")
     return f"<pre>{html.escape(nbsp_text, quote=False)}</pre>"
 
 
 async def _deliver_chords(query, context, vid: str, mode: str) -> None:
-    """Send the chord sheet as PNG photo(s) with pixel-exact chord-over-word layout.
-
-    Telegram text cannot align a Latin (LTR) chord row over a Hebrew (RTL)
-    lyric row — its font metrics and bidi reordering defeat any whitespace
-    math — so the sheet is rendered to an image where each chord label is
-    drawn at the pixel x-position of the lyric word it belongs to (same
-    alignment model as Tab4U's own site, verified against its rendering).
-    Falls back to the old text/document delivery if image rendering fails.
-    """
     song = _get_song(context, vid)
     analysis = context.user_data["chords"][vid]
-    chat_id = query.message.chat_id
-
-    try:
-        images = chords.render_images(analysis, song["title"], mode)
-    except Exception as exc:  # noqa: BLE001 - never let rendering kill the flow
-        logger.warning("Chord image rendering failed for %s: %s", song["title"], exc)
-        images = []
-
-    if images:
-        mode_label = "גרסה קלה" if mode == "easy" else "מקורי"
-        old_message_ids = context.user_data.setdefault("chord_msgs", {}).pop(vid, [])
-        new_message_ids = []
-        for index, image_bytes in enumerate(images):
-            buffer = io.BytesIO(image_bytes)
-            buffer.name = f"chords_{index + 1}.png"
-            is_last = index == len(images) - 1
-            message = await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=buffer,
-                caption=f"🎸 {song['title']} ({mode_label})" if is_last else None,
-                reply_markup=build_chord_keyboard(vid) if is_last else None,
-            )
-            new_message_ids.append(message.message_id)
-        context.user_data["chord_msgs"][vid] = new_message_ids
-        # Replace, don't accumulate: drop the previous delivery (old key version)
-        # and the "searching..." placeholder text message.
-        for message_id in old_message_ids:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            except Exception:  # noqa: BLE001 - already gone / too old to delete
-                pass
-        if not query.message.photo:
-            try:
-                await query.message.delete()
-            except Exception:  # noqa: BLE001
-                pass
-        return
-
-    # Fallback: plain-text delivery (no parsed sheet or Pillow failure).
     plain_text = chords.render(analysis, song["title"], mode)
-    if len(plain_text) <= TELEGRAM_TEXT_LIMIT - 100 and not query.message.photo:
+    if len(plain_text) <= TELEGRAM_TEXT_LIMIT - 100:
         try:
             await query.edit_message_text(
                 _as_pre(plain_text), parse_mode=ParseMode.HTML,
@@ -297,13 +252,11 @@ async def _deliver_chords(query, context, vid: str, mode: str) -> None:
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
                 return
-    # Too long for a message — send as a file, keep the menu available.
+    # Too long for a message — send as a file, keep the menu on the original message.
     buffer = io.BytesIO(plain_text.encode("utf-8"))
     buffer.name = f"{song['title']}.txt"
-    await context.bot.send_document(chat_id=chat_id, document=buffer)
-    await context.bot.send_message(
-        chat_id=chat_id, text=f"🎸 {song['title']}", reply_markup=build_song_menu(vid)
-    )
+    await context.bot.send_document(chat_id=query.message.chat_id, document=buffer)
+    await query.edit_message_text(f"🎸 {song['title']}", reply_markup=build_song_menu(vid))
 
 
 async def on_download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -814,6 +814,25 @@ def _transpose_row_text(row_text: str, semitones: int) -> str:
     return "".join(parts).rstrip()
 
 
+def _row_text_for_layout(row: "_ChordRow") -> str:
+    """The row's browser-faithful text, including Tab4U's own leading &nbsp;
+    padding on chords rows.
+
+    Tab4U never pads a chords row's *trailing* edge in a way that matters for
+    display (trailing whitespace on an independently left-anchored monospace
+    line is invisible either way), but it DOES pad the *leading* edge whenever
+    a chord's first token isn't at column 0 — e.g. a lone "Cm" that should
+    align under the middle of its lyric line is stored as "    Cm", not "Cm".
+    `row.text` (used for anything else — search matching, transposition
+    display, the plain-text fallback) has that leading padding stripped by
+    `_clean_visible_text`, which silently shifts every token's effective
+    column and was the root cause of six failed alignment attempts this
+    session. `row.layout_text` preserves it; fall back to `row.text` for rows
+    a test constructs without setting it.
+    """
+    return row.layout_text or row.text
+
+
 def _render_external_chord_sheet(
     title: str,
     parsed_sheet: _ParsedTab4USheet,
@@ -836,9 +855,9 @@ def _render_external_chord_sheet(
     for table in parsed_sheet.tables:
         for row in table:
             if row.kind == "chords":
-                text = _transpose_row_text(row.text, semitones)
+                text = _transpose_row_text(_row_text_for_layout(row), semitones)
             else:
-                text = row.text.rstrip()
+                text = _row_text_for_layout(row).rstrip()
             if text.strip():
                 lines.append(text.rstrip())
         if lines[-1] != "":
