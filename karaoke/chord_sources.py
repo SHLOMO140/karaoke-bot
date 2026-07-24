@@ -69,6 +69,10 @@ class _ChordRow:
     kind: str
     text: str
     tokens: list[_ChordToken] = field(default_factory=list)
+    # Browser-faithful cell text (leading/trailing &nbsp; preserved). Tab4U pads
+    # a chords row to its lyric row's width with edge spaces; the PNG renderer
+    # (chord_image.py) needs them verbatim to place chords above the right word.
+    layout_text: str = ""
 
 
 @dataclass
@@ -106,6 +110,25 @@ def _clean_visible_text(fragment: str) -> str:
     text = text.replace("\r", "").replace("\t", " ")
     text = re.sub(r" *\n *", "\n", text)
     return text.strip()
+
+
+def _clean_layout_text(fragment: str) -> str:
+    """Like _clean_visible_text, but browser-faithful about spacing.
+
+    Tab4U encodes chord positions purely with &nbsp; runs, and pads each chords
+    row with *leading and trailing* &nbsp; to exactly its paired lyric row's
+    character width - those edge spaces carry the alignment, so they must
+    survive. Plain source whitespace (indentation, newlines around spans) is
+    collapsed the way a browser collapses it; only &nbsp; survives as a layout
+    space.
+    """
+    text = re.sub(r"(?i)<br\s*/?>", "\ue000", fragment)
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    text = html.unescape(text)
+    # Collapse plain (collapsible) whitespace like a browser; NBSP is untouched.
+    text = re.sub(r"[ \t\r\n]+", " ", text)
+    lines = [segment.strip(" ") for segment in text.split("\ue000")]
+    return "\n".join(lines).replace("\xa0", " ").strip("\n")
 
 
 def _extract_chord_tokens(row_text: str) -> list[_ChordToken]:
@@ -163,11 +186,14 @@ def _parse_tab4u_sheet(page_html: str, source_url: str) -> _ParsedTab4USheet | N
             cleaned_text = _clean_visible_text(cell_html)
             if not cleaned_text:
                 continue
+            layout_text = _clean_layout_text(cell_html)
 
             if "chords" in normalized_class:
                 tokens = _extract_chord_tokens(cleaned_text)
                 chord_labels.extend(token.label for token in tokens)
-                chord_row = _ChordRow(kind="chords", text=cleaned_text, tokens=tokens)
+                chord_row = _ChordRow(
+                    kind="chords", text=cleaned_text, tokens=tokens, layout_text=layout_text
+                )
                 rows.append(chord_row)
                 pending_chord_row = chord_row if tokens else None
                 continue
@@ -175,7 +201,7 @@ def _parse_tab4u_sheet(page_html: str, source_url: str) -> _ParsedTab4USheet | N
             if "song" not in normalized_class:
                 continue
 
-            row = _ChordRow(kind="song", text=cleaned_text)
+            row = _ChordRow(kind="song", text=cleaned_text, layout_text=layout_text)
             rows.append(row)
 
             if _looks_like_section_heading(cleaned_text):
@@ -788,23 +814,6 @@ def _transpose_row_text(row_text: str, semitones: int) -> str:
     return "".join(parts).rstrip()
 
 
-def _right_align_chord_row(row_text: str, pair_width: int = 0) -> str:
-    """Right-justify a chords row within its paired lyric row's width, without
-    reordering its labels.
-
-    Confirmed straight from Tab4U's own stylesheet (.chords{direction:ltr;
-    text-align:right}): a chords row is explicitly forced LTR — its labels are
-    NEVER bidi-reordered, they stay in left-to-right storage order (Ab then Fm
-    stays Ab then Fm) — but the row as a whole is right-aligned, so a short
-    chord row (often just one label) sits flush with the right edge of the
-    much longer Hebrew lyric row beneath it (which has no such override, so it
-    renders as normal RTL Hebrew). `pair_width` is that lyric row's length;
-    left-padding to it reproduces the same right-alignment in a monospace
-    Telegram message.
-    """
-    return row_text.rjust(max(len(row_text), pair_width))
-
-
 def _render_external_chord_sheet(
     title: str,
     parsed_sheet: _ParsedTab4USheet,
@@ -814,7 +823,6 @@ def _render_external_chord_sheet(
     original_key: str,
     target_key: str,
     semitones: int,
-    mirror_chords_for_rtl: bool = False,
 ) -> str:
     header_parts = [f"כותרת: {title or 'ללא שם'}"]
     header_parts.append(f"קצב: {bpm:.0f}" if bpm > 0 else "קצב: לא ידוע")
@@ -826,13 +834,9 @@ def _render_external_chord_sheet(
 
     lines = header_parts + [""]
     for table in parsed_sheet.tables:
-        for i, row in enumerate(table):
+        for row in table:
             if row.kind == "chords":
                 text = _transpose_row_text(row.text, semitones)
-                if mirror_chords_for_rtl:
-                    next_row = table[i + 1] if i + 1 < len(table) else None
-                    pair_width = len(next_row.text.rstrip()) if next_row and next_row.kind != "chords" else 0
-                    text = _right_align_chord_row(text, pair_width)
             else:
                 text = row.text.rstrip()
             if text.strip():

@@ -2,5 +2,6 @@ python-telegram-bot==21.6
 yt-dlp==2026.3.17
 aiohttp
 regex==2026.2.28
+Pillow>=10.0
 gradio==4.44.1
 huggingface_hub==0.25.2
