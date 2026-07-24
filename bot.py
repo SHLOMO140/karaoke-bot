@@ -225,12 +225,18 @@ async def on_chord_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def _as_pre(text: str) -> str:
-    """Wrap chord-sheet text as a Telegram monospace (<pre>) block, so the
-    space padding that right-aligns each chords row to its lyric row (see
-    chords.render(..., for_telegram=True)) renders at a fixed character width
-    instead of a proportional font, where the same space count doesn't line up
-    the same as the character count above/below it."""
-    return f"<pre>{html.escape(text, quote=False)}</pre>"
+    """Wrap chord-sheet text as a Telegram monospace (<pre>) block.
+
+    Regular spaces are swapped for U+00A0 (non-breaking space) first — Tab4U's
+    own source does the same (every space in its chord/lyric HTML is a literal
+    &nbsp;, never a plain space), specifically so nothing in the delivery
+    pipeline collapses or trims the spacing that right-aligns each chords row
+    to its lyric row (see chords.render(..., for_telegram=True)). A regular
+    space is otherwise a normal collapsible whitespace character in most text
+    pipelines; nbsp is not, so it survives verbatim into the message.
+    """
+    nbsp_text = text.replace(" ", " ")
+    return f"<pre>{html.escape(nbsp_text, quote=False)}</pre>"
 
 
 async def _deliver_chords(query, context, vid: str, mode: str) -> None:
